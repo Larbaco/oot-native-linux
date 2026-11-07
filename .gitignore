@@ -31,3 +31,4 @@ program.db
 shots/
 bin/
 setup-*.log
+release/local.mk

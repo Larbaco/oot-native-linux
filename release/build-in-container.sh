@@ -1,83 +1,69 @@
 #!/usr/bin/env bash
-# Build-only entrypoint for Docker Ubuntu 22.04. The host make-release script
-# mounts this checkout at /src and an NVMe work directory at /out.
+# Build entrypoint for the pinned Ubuntu 22.04 release image. release/pipeline.sh mounts the exported
+# source at /src, the per-run work directory at /out and the shared, checksum-verified cache at /cache,
+# then runs one phase per container: prep, tests-python, build, ctest, tests-native, stage.
+# Nothing here chooses a version, a date or a download: those arrive pinned (release/pins.env) or fail.
 set -euo pipefail
+PHASE=${1:?usage: build-in-container.sh <prep|tests-python|build|ctest|tests-native|stage>}
 
 ROOT=/src
 OUT=/out
-PKG_NAME=${NXS2_RELEASE_PKG_NAME:-oot-native-linux-x86_64-v0.1.0}
+CACHE=/cache
+DL="$CACHE/downloads"
+PKG_NAME=${NXS2_RELEASE_PKG_NAME:?NXS2_RELEASE_PKG_NAME is required}
 PKG="$OUT/$PKG_NAME"
 ART="$OUT/artifacts"
 JOBS=${NXS2_JOBS:-8}
-if ! [[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || (( JOBS > 12 )); then
-  echo "NXS2_JOBS must be between 1 and 12" >&2
+if ! [[ "$JOBS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "NXS2_JOBS must be a whole number of 1 or more" >&2
   exit 2
 fi
-require_root_space() {
-  local root=${OOT_HOST_ROOT:-/host-root} available_kb
-  [[ -d "$root" ]] || root=/
-  available_kb=$(df -Pk "$root" | awk 'NR==2 {print $4}')
-  df -h "$root"
-  if [[ ! "$available_kb" =~ ^[0-9]+$ ]] || (( available_kb < 12582912 )); then
-    echo "release build: stopping; host / must retain at least 12 GiB free" >&2
-    exit 2
-  fi
-}
+: "${SOURCE_DATE_EPOCH:?SOURCE_DATE_EPOCH must come from the commit timestamp}"
+export SOURCE_DATE_EPOCH TZ=UTC LC_ALL=C.UTF-8 PYTHONHASHSEED=0
+umask 022
+set -a; . "$ROOT/release/pins.env"; set +a
 PYTHON_VERSION=3.12.12
-MESON_VERSION=1.5.2
 DAV1D_VERSION=1.5.1
 FFMPEG_VERSION=7.1.1
-DAV1D_SHA256=401813f1f89fa8fd4295805aa5284d9aed9bc7fc1fdbe554af4292f64cbabe21
-FFMPEG_SHA256=733984395e0dbbe5c046abda2dc49a5544e7e0e1e2366bba849222ae9e3a03b1
 mkdir -p "$OUT/tmp" "$OUT/toolchains" "$ART" "$PKG/builder/bin" "$PKG/builder/lib" "$PKG/builder/ampere-lower"
-if ! command -v meson >/dev/null; then
-  require_root_space
-  nice -n 19 ionice -c3 /opt/release-venv/bin/python -m pip install --disable-pip-version-check --no-cache-dir "meson==$MESON_VERSION"
-fi
-if ! command -v nasm >/dev/null; then
-  require_root_space
-  nice -n 19 ionice -c3 apt-get update
-  require_root_space
-  nice -n 19 ionice -c3 apt-get install -y --no-install-recommends nasm
-  apt-get clean
-  rm -rf /var/lib/apt/lists/*
-fi
 
-# Pinned, LGPL/BSD codec stack. Keep the exact upstream tarballs for the
-# adjacent third-party-source archive assembled by make-release.sh.
-CODEC_SRC="$OUT/codec-source"
-mkdir -p "$CODEC_SRC"
-DAV1D_TARBALL="$CODEC_SRC/dav1d-$DAV1D_VERSION.tar.xz"
-FFMPEG_TARBALL="$CODEC_SRC/ffmpeg-$FFMPEG_VERSION.tar.xz"
-[[ -s "$DAV1D_TARBALL" ]] || curl -fL --retry 3 "https://download.videolan.org/pub/videolan/dav1d/$DAV1D_VERSION/dav1d-$DAV1D_VERSION.tar.xz" -o "$DAV1D_TARBALL"
-[[ -s "$FFMPEG_TARBALL" ]] || curl -fL --retry 3 "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz" -o "$FFMPEG_TARBALL"
-echo "$DAV1D_SHA256  $DAV1D_TARBALL" | sha256sum -c -
-echo "$FFMPEG_SHA256  $FFMPEG_TARBALL" | sha256sum -c -
-DAV1D_SRC="$OUT/tmp/dav1d-$DAV1D_VERSION"
-FFMPEG_SRC="$OUT/tmp/ffmpeg-$FFMPEG_VERSION"
+check_download() {   # <file> <sha256>: fail closed on any mismatch
+  local file="$DL/$1"
+  [[ -f "$file" ]] || { echo "missing pinned download: $file" >&2; exit 1; }
+  echo "$2  $file" | sha256sum -c --quiet - || { echo "pinned download does not match its SHA-256: $1" >&2; exit 1; }
+}
+
+PYTHON="$PKG/python/bin/python3"
+SITE="$PKG/python/lib/python3.12/site-packages"
+LLVM="$OUT/toolchains/llvm-23.1.4"
+SDL="$OUT/toolchains/SDL3-3.4.18"
+BUILD="$ROOT/windows/build/linux-0400486024DEC000"
 CODEC_PREFIX="$OUT/toolchains/codec"
-FFMPEG_CONFIG_STAMP="$CODEC_PREFIX/.ffmpeg-$FFMPEG_VERSION-libdav1d-decoder-configured"
-export PKG_CONFIG_PATH="$CODEC_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-export LD_LIBRARY_PATH="$CODEC_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-if [[ ! -f "$CODEC_PREFIX/lib/pkgconfig/dav1d.pc" ]]; then
-  tar -xf "$DAV1D_TARBALL" -C "$OUT/tmp"
-  if [[ ! -f "$OUT/tmp/dav1d-build/build.ninja" ]]; then rm -rf "$OUT/tmp/dav1d-build"; fi
-  require_root_space
-  nice -n 19 ionice -c3 meson setup "$OUT/tmp/dav1d-build" "$DAV1D_SRC" --prefix="$CODEC_PREFIX" --libdir=lib -Denable_tools=false -Denable_tests=false
-  require_root_space
+
+tool_env() {
+  export PATH="$PKG/python/bin:/opt/dotnet:/opt/release-venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  export DOTNET_ROOT=/opt/dotnet DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1
+  export NXNATIVE="$ROOT/nxnative" NXL_TOOLCHAINS="$OUT/toolchains" NXS2_BIN="$PKG/builder/bin"
+  export NXS2_ZBIC_UNPACK="$PKG/builder/bin/zbic-unpack" NXS2_JOBS="$JOBS" PYTHONDONTWRITEBYTECODE=1 PYTHONUTF8=1
+  export NXS2_RELEASE_PACKAGE=1 NXS2_DOWNLOADS="$DL"
+  export NXS2_CMAKE_ARGS="-DNXRT_ENABLE_FFMPEG=ON"
+  export PKG_CONFIG_PATH="$CODEC_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+  export LD_LIBRARY_PATH="$CODEC_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+}
+
+# FFmpeg 7.1.1 (LGPL, decoders only: libdav1d AV1 + matroska) and dav1d 1.5.1 (BSD-2-Clause), built from the pinned tarballs
+# into a per-run prefix and bundled in builder/lib. Flags are those of the v0.1.3 build; libdir is forced to lib.
+build_codecs() {
+  local dav1d_src="$OUT/tmp/dav1d-$DAV1D_VERSION" ffmpeg_src="$OUT/tmp/ffmpeg-$FFMPEG_VERSION"
+  export PKG_CONFIG_PATH="$CODEC_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+  export LD_LIBRARY_PATH="$CODEC_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  rm -rf "$CODEC_PREFIX" "$dav1d_src" "$ffmpeg_src" "$OUT/tmp/dav1d-build"
+  tar -xf "$DL/$DL_DAV1D_FILE" -C "$OUT/tmp" --no-same-owner
+  nice -n 19 ionice -c3 meson setup "$OUT/tmp/dav1d-build" "$dav1d_src" --prefix="$CODEC_PREFIX" --libdir=lib -Denable_tools=false -Denable_tests=false
   nice -n 19 ionice -c3 ninja -C "$OUT/tmp/dav1d-build" -j "$JOBS"
   nice -n 19 ionice -c3 ninja -C "$OUT/tmp/dav1d-build" install
-fi
-FFMPEG_LIBDIR=
-if [[ -f "$CODEC_PREFIX/lib/pkgconfig/libavcodec.pc" ]]; then
-  FFMPEG_LIBDIR=$(pkg-config --variable=libdir libavcodec 2>/dev/null || true)
-fi
-if [[ ! -f "$FFMPEG_CONFIG_STAMP" || ! -f "$CODEC_PREFIX/lib/pkgconfig/libavcodec.pc" || "$FFMPEG_LIBDIR" != "$CODEC_PREFIX/lib" ]]; then
-  rm -rf "$FFMPEG_SRC"
-  rm -f "$FFMPEG_CONFIG_STAMP"
-  tar -xf "$FFMPEG_TARBALL" -C "$OUT/tmp"
-  require_root_space
-  (cd "$FFMPEG_SRC" && nice -n 19 ionice -c3 ./configure \
+  tar -xf "$DL/$DL_FFMPEG_FILE" -C "$OUT/tmp" --no-same-owner
+  (cd "$ffmpeg_src" && nice -n 19 ionice -c3 ./configure \
     --prefix="$CODEC_PREFIX" --libdir="$CODEC_PREFIX/lib" --pkgconfigdir="$CODEC_PREFIX/lib/pkgconfig" \
     --disable-gpl --disable-nonfree --disable-programs --disable-doc --disable-everything \
     --disable-avdevice --disable-avfilter --disable-swscale --disable-swresample --disable-postproc \
@@ -85,77 +71,76 @@ if [[ ! -f "$FFMPEG_CONFIG_STAMP" || ! -f "$CODEC_PREFIX/lib/pkgconfig/libavcode
     --enable-decoder=libdav1d --enable-parser=av1 --enable-demuxer=matroska --enable-protocol=file \
     --enable-libdav1d --extra-cflags="-I$CODEC_PREFIX/include" \
     --extra-ldflags="-L$CODEC_PREFIX/lib")
-  require_root_space
-  nice -n 19 ionice -c3 make -C "$FFMPEG_SRC" -j "$JOBS"
-  nice -n 19 ionice -c3 make -C "$FFMPEG_SRC" install
-  touch "$FFMPEG_CONFIG_STAMP"
-fi
-PYTHON_TARBALL="$OUT/tmp/Python-$PYTHON_VERSION.tgz"
-PYTHON_SOURCE="$OUT/tmp/Python-$PYTHON_VERSION"
-if [[ ! -x "$PKG/python/bin/python3.12" ]]; then
-  curl -fL --retry 3 "https://www.python.org/ftp/python/$PYTHON_VERSION/Python-$PYTHON_VERSION.tgz" -o "$PYTHON_TARBALL"
-  tar -xzf "$PYTHON_TARBALL" -C "$OUT/tmp"
-  require_root_space
-  (cd "$PYTHON_SOURCE" && \
-    CFLAGS="-O2 -ffile-prefix-map=$PYTHON_SOURCE=." \
+  nice -n 19 ionice -c3 make -C "$ffmpeg_src" -j "$JOBS"
+  nice -n 19 ionice -c3 make -C "$ffmpeg_src" install
+  [[ "$(pkg-config --variable=libdir libavcodec)" == "$CODEC_PREFIX/lib" ]] || { echo "libavcodec resolved from outside the per-run prefix" >&2; exit 1; }
+}
+
+phase_prep() {
+  for key in LLVM SDL3 VULKAN PYTHON DOTNET_RUNTIME DOTNET_SDK RMS_LICENSE FFMPEG DAV1D; do
+    file=DL_${key}_FILE; sum=DL_${key}_SHA256
+    check_download "${!file}" "${!sum}"
+  done
+  # LLVM is the 12 GB prebuilt toolchain: unpacked once into the shared cache, stamped with the verified archive hash.
+  mkdir -p "$CACHE/toolchains"
+  if [[ "$(cat "$CACHE/toolchains/llvm-23.1.4.stamp" 2>/dev/null || true)" != "$DL_LLVM_SHA256" ]]; then
+    echo "unpacking the verified LLVM archive into the cache"
+    rm -rf "$CACHE/toolchains/llvm-23.1.4" "$CACHE/toolchains/llvm-23.1.4.stamp"
+    mkdir -p "$CACHE/toolchains/llvm-23.1.4"
+    zstd -d --long=30 -c "$DL/$DL_LLVM_FILE" | tar -xf - -C "$CACHE/toolchains/llvm-23.1.4" --strip-components=1 --no-same-owner
+    printf '%s' "$DL_LLVM_SHA256" > "$CACHE/toolchains/llvm-23.1.4.stamp"
+  fi
+  ln -sfn "$CACHE/toolchains/llvm-23.1.4" "$LLVM"
+
+  build_codecs
+
+  rm -rf "$OUT/tmp/Python-$PYTHON_VERSION"
+  tar -xzf "$DL/$DL_PYTHON_FILE" -C "$OUT/tmp" --no-same-owner
+  local src="$OUT/tmp/Python-$PYTHON_VERSION"
+  (cd "$src" && \
+    CFLAGS="-O2 -ffile-prefix-map=$src=." \
     LDFLAGS='-Wl,-rpath,$ORIGIN/../lib' \
     ./configure --prefix="$PKG/python" --enable-shared --with-ensurepip=install --enable-loadable-sqlite-extensions && \
     make -j"$JOBS" && make install)
   patchelf --set-rpath '$ORIGIN/../lib' "$PKG/python/bin/python3.12"
   ln -sf python3.12 "$PKG/python/bin/python3"
-fi
-# The builder never imports dbm/gdbm. These optional CPython extensions pull in
-# host gdbm shared libraries, so leave them out of the embedded runtime.
-find "$PKG/python/lib/python3.12/lib-dynload" -maxdepth 1 -type f \
-  \( -name '_dbm*.so' -o -name '_gdbm*.so' \) -delete
-PYTHON="$PKG/python/bin/python3"
-SITE="$PKG/python/lib/python3.12/site-packages"
-mkdir -p "$SITE"
-"$PYTHON" -m pip install --disable-pip-version-check --no-compile --no-warn-script-location --target "$SITE" -r "$ROOT/release/requirements-runtime.txt"
+  # The builder never imports dbm/gdbm. These optional CPython extensions pull in
+  # host gdbm shared libraries, so leave them out of the embedded runtime.
+  find "$PKG/python/lib/python3.12/lib-dynload" -maxdepth 1 -type f \
+    \( -name '_dbm*.so' -o -name '_gdbm*.so' \) -delete
+  mkdir -p "$SITE"
+  "$PYTHON" -m pip install --disable-pip-version-check --no-compile --no-warn-script-location --require-hashes --target "$SITE" -r "$ROOT/release/requirements-runtime.lock"
+}
 
-export PATH="$PKG/python/bin:/opt/dotnet:/opt/release-venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-export DOTNET_ROOT=/opt/dotnet DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1
-export NXNATIVE="$ROOT/nxnative" NXL_TOOLCHAINS="$OUT/toolchains" NXS2_BIN="$PKG/builder/bin"
-export NXS2_ZBIC_UNPACK="$PKG/builder/bin/zbic-unpack" NXS2_JOBS="$JOBS" PYTHONDONTWRITEBYTECODE=1 PYTHONUTF8=1
-export NXS2_RELEASE_PACKAGE=1
-export NXS2_CMAKE_ARGS="-DNXRT_ENABLE_FFMPEG=ON"
+# Unit tests that need no native tool; the zbic-dependent ones run again in tests-native.
+phase_tests_python() {
+  tool_env; cd "$ROOT"
+  unset NXS2_ZBIC_UNPACK   # not built yet: its tests run in tests-native
+  "$PYTHON" -m unittest discover -s tests -v 2>&1 | tee "$OUT/python-tests.log"
+  "$PYTHON" -m unittest discover -s tools/tests -v 2>&1 | tee "$OUT/tool-tests.log"
+}
 
-cd "$ROOT"
-require_root_space
-nice -n 19 ionice -c3 "$PYTHON" nxs2.py setup 2>&1 | tee "$OUT/setup.log"
-BUILD="$ROOT/windows/build/linux-0400486024DEC000"
-require_root_space
-nice -n 19 ionice -c3 cmake --build "$BUILD" -j "$JOBS" 2>&1 | tee "$OUT/ctest-build.log"
-export LD_LIBRARY_PATH="$NXL_TOOLCHAINS/llvm-23.1.4/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-require_root_space
-nice -n 19 ionice -c3 ctest --test-dir "$BUILD" --output-on-failure --parallel "$JOBS" 2>&1 | tee "$OUT/ctest.log"
+phase_build() {
+  tool_env; cd "$ROOT"
+  # The pinned nxnative checkout is seeded by the host; refuse anything else before and after setup.
+  [[ "$(git -C "$ROOT/nxnative" rev-parse HEAD)" == "$NXNATIVE_COMMIT" ]] || { echo "nxnative is not at the pinned commit" >&2; exit 1; }
+  nice -n 19 ionice -c3 "$PYTHON" nxs2.py setup 2>&1 | tee "$OUT/setup.log"
+  [[ "$(git -C "$ROOT/nxnative" rev-parse HEAD)" == "$NXNATIVE_COMMIT" ]] || { echo "nxnative moved off the pinned commit during setup" >&2; exit 1; }
+  nice -n 19 ionice -c3 cmake --build "$BUILD" -j "$JOBS" 2>&1 | tee "$OUT/ctest-build.log"
+}
 
-LLVM="$OUT/toolchains/llvm-23.1.4"
-SDL="$OUT/toolchains/SDL3-3.4.18"
-for name in nxanalyze nxlift nxrt nxrt-movie-decode zbic-unpack; do
-  install -m 0755 "$BUILD/bin/$name" "$PKG/builder/bin/$name"
-done
-install -m 0755 "$LLVM/bin/ld.lld" "$PKG/builder/bin/ld.lld"
-install -m 0755 "$(command -v spirv-opt)" "$PKG/builder/bin/spirv-opt"
-install -m 0755 "$(command -v spirv-val)" "$PKG/builder/bin/spirv-val"
-install -m 0644 "$BUILD/bin/libSDL3.so.0" "$PKG/builder/lib/libSDL3.so.0"
-install -m 0644 "$CODEC_PREFIX"/lib/libdav1d.so.* "$PKG/builder/lib/"
-install -m 0644 "$CODEC_PREFIX"/lib/libavutil.so.* "$PKG/builder/lib/"
-install -m 0644 "$CODEC_PREFIX"/lib/libavcodec.so.* "$PKG/builder/lib/"
-install -m 0644 "$CODEC_PREFIX"/lib/libavformat.so.* "$PKG/builder/lib/"
-for codec_lib in "$PKG"/builder/lib/libdav1d.so.* "$PKG"/builder/lib/libavutil.so.* "$PKG"/builder/lib/libavcodec.so.* "$PKG"/builder/lib/libavformat.so.*; do
-  patchelf --set-rpath '$ORIGIN' "$codec_lib"
-done
-patchelf --set-rpath '$ORIGIN/../lib' "$PKG/builder/bin/nxrt-movie-decode"
-install -m 0755 "$ROOT/ampere-lower/ampere-lower" "$PKG/builder/ampere-lower/ampere-lower"
-patchelf --set-rpath '$ORIGIN/../lib' "$PKG/builder/bin/nxrt"
-install -D -m 0644 "$FFMPEG_SRC/COPYING.LGPLv2.1" "$PKG/LICENSES/FFmpeg-LGPL-2.1.txt"
-install -D -m 0644 "$DAV1D_SRC/COPYING" "$PKG/LICENSES/dav1d-BSD-2-Clause.txt"
+phase_ctest() {
+  tool_env; cd "$ROOT"
+  export LD_LIBRARY_PATH="$NXL_TOOLCHAINS/llvm-23.1.4/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  nice -n 19 ionice -c3 ctest --test-dir "$BUILD" --output-on-failure --parallel "$JOBS" 2>&1 | tee "$OUT/ctest.log"
+}
 
-require_root_space
-"$PYTHON" -m unittest discover -s tests -v 2>&1 | tee "$OUT/python-tests.log"
-"$PYTHON" -m unittest discover -s tools/tests -v 2>&1 | tee "$OUT/tool-tests.log"
-"$PYTHON" - <<'PY'
+phase_tests_native() {
+  tool_env; cd "$ROOT"
+  install -m 0755 "$BUILD/bin/zbic-unpack" "$PKG/builder/bin/zbic-unpack"
+  "$PYTHON" -m unittest tests.test_nso_zbic -v 2>&1 | tee "$OUT/zbic-tests.log"
+  if grep -q 'skipped' "$OUT/zbic-tests.log"; then echo "zbic tests were skipped although zbic-unpack is built" >&2; exit 1; fi
+  "$PYTHON" - <<'PY'
 import os, subprocess, zstandard
 raw=b"synthetic ZBIC frame for the isolated helper test"*9
 frame=zstandard.ZstdCompressor(write_content_size=True).compress(raw)
@@ -164,6 +149,29 @@ p=subprocess.run([os.environ["NXS2_ZBIC_UNPACK"],"--stream"],input=encoded,stdou
 if p.returncode or p.stdout!=raw: raise SystemExit(p.stderr.decode("utf-8","replace") or "synthetic ZBIC helper round trip failed")
 print("PASS: synthetic ZBIC frame round-tripped through zbic-unpack subprocess")
 PY
+}
+
+phase_stage() {
+  tool_env; cd "$ROOT"
+  export LD_LIBRARY_PATH="$NXL_TOOLCHAINS/llvm-23.1.4/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  for name in nxanalyze nxlift nxrt nxrt-movie-decode zbic-unpack; do
+    install -m 0755 "$BUILD/bin/$name" "$PKG/builder/bin/$name"
+  done
+  install -m 0755 "$LLVM/bin/ld.lld" "$PKG/builder/bin/ld.lld"
+  install -m 0755 "$(command -v spirv-opt)" "$PKG/builder/bin/spirv-opt"
+  install -m 0755 "$(command -v spirv-val)" "$PKG/builder/bin/spirv-val"
+  install -m 0644 "$BUILD/bin/libSDL3.so.0" "$PKG/builder/lib/libSDL3.so.0"
+  for codec in libdav1d libavutil libavcodec libavformat; do
+    install -m 0644 "$CODEC_PREFIX"/lib/$codec.so.* "$PKG/builder/lib/"
+  done
+  for codec_lib in "$PKG"/builder/lib/libdav1d.so.* "$PKG"/builder/lib/libavutil.so.* "$PKG"/builder/lib/libavcodec.so.* "$PKG"/builder/lib/libavformat.so.*; do
+    patchelf --set-rpath '$ORIGIN' "$codec_lib"
+  done
+  patchelf --set-rpath '$ORIGIN/../lib' "$PKG/builder/bin/nxrt-movie-decode"
+  install -D -m 0644 "$OUT/tmp/ffmpeg-$FFMPEG_VERSION/COPYING.LGPLv2.1" "$PKG/LICENSES/FFmpeg-LGPL-2.1.txt"
+  install -D -m 0644 "$OUT/tmp/dav1d-$DAV1D_VERSION/COPYING" "$PKG/LICENSES/dav1d-BSD-2-Clause.txt"
+  install -m 0755 "$ROOT/ampere-lower/ampere-lower" "$PKG/builder/ampere-lower/ampere-lower"
+  patchelf --set-rpath '$ORIGIN/../lib' "$PKG/builder/bin/nxrt"
 
 while IFS= read -r source; do
   [[ -z "$source" || "$source" == \#* ]] && continue
@@ -197,8 +205,7 @@ fi
 # NuGet packages declare their licenses and copyright in the package metadata;
 # upstream license texts below come from pinned source or the package metadata.
 # Humanizer 3.0.10's nuspec copyright is reproduced in the MIT text header.
-curl -fsSL "https://raw.githubusercontent.com/Microsoft/Microsoft.IO.RecyclableMemoryStream/e29a28387da9018fa9605a1dcb3f7a0435aa9974/LICENSE" \
-  -o "$PKG/LICENSES/RecyclableMemoryStream-MIT.txt"
+install -D -m 0644 "$DL/$DL_RMS_LICENSE_FILE" "$PKG/LICENSES/RecyclableMemoryStream-MIT.txt"
 {
   printf '%s\n\n' 'MsgPack.Cli 1.0.1' 'Copyright 2010-2016 FUJIWARA, Yusuke, all rights reserved.'
   cat /usr/share/common-licenses/Apache-2.0
@@ -218,7 +225,13 @@ install -D -m 0644 "$ROOT/release/README-RELEASE.md" "$PKG/README-RELEASE.md"
 install -D -m 0644 "$ROOT/README.md" "$PKG/README.md"
 install -D -m 0644 "$ROOT/release/THIRD-PARTY-NOTICES.md" "$PKG/THIRD-PARTY-NOTICES.md"
 install -D -m 0644 "$ROOT/release/THIRD-PARTY-SOURCE.md" "$PKG/THIRD-PARTY-SOURCE.md"
-install -D -m 0644 "$ROOT/TESTER-v0.1.3.md" "$PKG/TESTER-v0.1.3.md"
+# The tester guide of this release (TESTER-v<base version>.md) is mandatory; the pipeline also checks the allowlist.
+: "${NXS2_RELEASE_VERSION:?NXS2_RELEASE_VERSION is required}"
+TESTER_GUIDE="TESTER-v${NXS2_RELEASE_VERSION%%-*}.md"
+[[ -f "$ROOT/$TESTER_GUIDE" ]] || { echo "missing tester guide $TESTER_GUIDE" >&2; exit 1; }
+install -D -m 0644 "$ROOT/$TESTER_GUIDE" "$PKG/$TESTER_GUIDE"
+# File names and the version in the documentation come from VERSION: fill the placeholders (in the package and in builder/release/).
+/usr/bin/python3 -I "$ROOT/release/render_docs.py" render-tree "$PKG" --version "$NXS2_RELEASE_VERSION" --pkg-name "$PKG_NAME"
 install -D -m 0644 /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf "$PKG/fonts/DejaVuSans.ttf"
 install -D -m 0644 /usr/share/doc/fonts-dejavu-core/copyright "$PKG/LICENSES/DejaVu-font-license.txt"
 
@@ -254,7 +267,9 @@ for name, start_marker, end_marker, filename in sections:
 PY
 cp -a /usr/share/doc/tcl8.6/copyright "$PKG/LICENSES/Tcl-8.6-copyright.txt"
 cp -a /usr/share/doc/tk8.6/copyright "$PKG/LICENSES/Tk-8.6-copyright.txt"
-/usr/local/bin/dotnet-install.sh --runtime dotnet --channel 10.0 --install-dir "$PKG/dotnet" --no-path
+# The runtime is the pinned, checksum-verified tarball (no installer script, no floating channel).
+mkdir -p "$PKG/dotnet"
+tar -xzf "$DL/$DL_DOTNET_RUNTIME_FILE" -C "$PKG/dotnet" --no-same-owner
 # This optional EventPipe/LTTng adapter targets liblttng-ust.so.0, which is not
 # shipped in Ubuntu 22.04. The builder uses no LTTng tracing provider.
 find "$PKG/dotnet/shared/Microsoft.NETCore.App" -maxdepth 2 -type f \
@@ -332,7 +347,7 @@ with out.open('a', encoding='utf-8') as f:
 PY
 
 python3 -m venv "$OUT/launcher-venv"
-"$OUT/launcher-venv/bin/python" -m pip install --disable-pip-version-check --no-cache-dir pyinstaller==6.12.0
+"$OUT/launcher-venv/bin/python" -m pip install --disable-pip-version-check --no-cache-dir --require-hashes -r "$ROOT/release/requirements-launcher.lock"
 python3 - "$OUT/launcher-venv" "$PKG/LICENSES" "$PKG/THIRD-PARTY-NOTICES.md" <<'PY'
 import importlib.metadata as md
 import pathlib, shutil, sys
@@ -357,7 +372,8 @@ with notices.open('a', encoding='utf-8') as f:
     f.write('\n### PyInstaller environment dependencies\n\n' + '\n'.join(sorted(selected)) + '\n')
 PY
 mkdir -p "$OUT/pyinstaller-work"
-"$OUT/launcher-venv/bin/pyinstaller" --noconfirm --clean --onefile --name oot-native-launcher \
+# PYTHONHASHSEED=1 and SOURCE_DATE_EPOCH make PyInstaller's archive order and bytecode timestamps reproducible.
+PYTHONHASHSEED=1 "$OUT/launcher-venv/bin/pyinstaller" --noconfirm --clean --onefile --name oot-native-launcher \
   --paths "$ROOT" --distpath "$PKG" --workpath "$OUT/pyinstaller-work" --specpath "$OUT" "$ROOT/launcher/oot_native_launcher.py"
 chmod 0755 "$PKG/oot-native-launcher"
 "$PKG/oot-native-launcher" --help > "$OUT/launcher-help.txt"
@@ -549,3 +565,15 @@ print(f'package staging: {len(files)} files before source archive and checksums'
 PY
 
 printf 'Ubuntu 22.04 container build complete\n' > "$OUT/build-result.txt"
+
+}
+
+case "$PHASE" in
+  prep) phase_prep ;;
+  tests-python) phase_tests_python ;;
+  build) phase_build ;;
+  ctest) phase_ctest ;;
+  tests-native) phase_tests_native ;;
+  stage) phase_stage ;;
+  *) echo "unknown phase: $PHASE" >&2; exit 2 ;;
+esac

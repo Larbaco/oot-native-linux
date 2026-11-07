@@ -21,6 +21,7 @@ if not getattr(sys, "frozen", False):
 from oot_native_i18n import (DEFAULT_LANGUAGE, LANGUAGES, doctor_detail_key,
                             doctor_label_key, dump_error_key, normalize_language,
                             resolve_language, tr)
+import oot_native_jobs as njobs
 
 TITLE_ID = "0400486024DEC000"
 PACKAGE_HOME = pathlib.Path(os.environ.get("OOT_NATIVE_HOME") or (pathlib.Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else pathlib.Path(__file__).resolve().parents[1]))
@@ -46,14 +47,30 @@ def load_language_config(path: pathlib.Path | None = None) -> dict[str, object]:
         return {}
 
 
-def save_language_config(language: str, path: pathlib.Path | None = None) -> bool:
+def update_config(changes: dict[str, object], path: pathlib.Path | None = None) -> bool:
+    """Merge ``changes`` into launcher.json (a None value removes its key); the other keys are kept."""
     try:
         target = path or language_config_path()
+        data = load_language_config(target)
+        for key, value in changes.items():
+            if value is None:
+                data.pop(key, None)
+            else:
+                data[key] = value
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps({"language": language}, ensure_ascii=False) + "\n", encoding="utf-8")
+        target.write_text(json.dumps(data, ensure_ascii=False) + "\n", encoding="utf-8")
         return True
     except (OSError, UnicodeError, TypeError):
         return False
+
+
+def save_language_config(language: str, path: pathlib.Path | None = None) -> bool:
+    return update_config({"language": language}, path)
+
+
+def save_jobs_config(jobs: int, default: int, path: pathlib.Path | None = None) -> bool:
+    """Remember the GUI's build jobs; a value equal to the default is not stored, so the default keeps following the machine."""
+    return update_config({"jobs": None if jobs == default else jobs}, path)
 
 
 def package_env(language: str = DEFAULT_LANGUAGE) -> dict[str, str]:
@@ -87,6 +104,7 @@ def package_env(language: str = DEFAULT_LANGUAGE) -> dict[str, str]:
     env["DOTNET_NOLOGO"] = "1"
     env["DOTNET_SYSTEM_GLOBALIZATION_INVARIANT"] = "1"
     env["OOT_NATIVE_LANG"] = normalize_language(language) or DEFAULT_LANGUAGE
+    env["OOT_NATIVE_LAUNCHER"] = "1"   # the builder leaves the jobs warnings to the launcher, which already showed them
     return env
 
 
@@ -201,8 +219,28 @@ class Launcher:
         self.resolution = tk.StringVar(value="1600x900")
         self.silent = tk.BooleanVar(value=False)
         self.gamemode = tk.BooleanVar(value=False)
+        self.plan = njobs.default_plan()
+        initial = self._initial_jobs()
+        self.jobs = tk.StringVar(value=str(initial))
+        self.jobs_summary = tk.StringVar()
+        self.jobs_priority = tk.StringVar()
         self._ui()
+        self.jobs.trace_add("write", lambda *_: self._jobs_changed())
+        self._jobs_changed()
+        for line in self._startup_notes:
+            self._append(line + "\n")
         self.root.after(100, self._pump)
+
+    def _initial_jobs(self) -> int:
+        """OOT_NATIVE_JOBS, else the saved value, else the default (the GUI has no --jobs)."""
+        self._startup_notes: list[str] = []
+        try:
+            choice = njobs.resolve_jobs(None, saved=njobs.saved_jobs(load_language_config()), plan=self.plan)
+        except njobs.JobsError as exc:
+            self._startup_notes.append(tr(self.lang, "jobs_ignored_env", value=exc.value))
+            choice = njobs.resolve_jobs(None, environ={}, saved=njobs.saved_jobs(load_language_config()), plan=self.plan)
+        self._startup_notes.extend(njobs.render_warnings(self.lang, choice.warnings))
+        return choice.jobs
 
     def _ui(self) -> None:
         body = ttk.Frame(self.root, padding=14)
@@ -233,7 +271,15 @@ class Launcher:
         ttk.Combobox(options, textvariable=self.resolution, values=("1280x720", "1600x900", "1920x1080"), width=13, state="readonly").grid(row=0, column=2, sticky="w")
         ttk.Checkbutton(options, text=tr(self.lang, "silent"), variable=self.silent).grid(row=1, column=0, sticky="w")
         ttk.Checkbutton(options, text=tr(self.lang, "gamemode"), variable=self.gamemode).grid(row=1, column=1, columnspan=2, sticky="w")
-        ttk.Label(options, text=tr(self.lang, "build_priority"), foreground="#555").grid(row=2, column=0, columnspan=3, sticky="w", pady=(7, 0))
+        jobs_row = ttk.Frame(options)
+        jobs_row.grid(row=2, column=0, columnspan=3, sticky="w", pady=(7, 0))
+        ttk.Label(jobs_row, text=tr(self.lang, "jobs_label")).pack(side="left")
+        self.jobs_spin = ttk.Spinbox(jobs_row, textvariable=self.jobs, from_=1, to=max(64, self.plan.threads * 2), width=6)
+        self.jobs_spin.pack(side="left", padx=(6, 10))
+        self.jobs_spin.bind("<FocusOut>", lambda _e: self._save_jobs())
+        ttk.Label(jobs_row, textvariable=self.jobs_summary).pack(side="left")
+        ttk.Label(options, text=tr(self.lang, "jobs_default_hint", default=self.plan.jobs), foreground="#555", wraplength=620).grid(row=3, column=0, columnspan=3, sticky="w", pady=(3, 0))
+        ttk.Label(options, textvariable=self.jobs_priority, foreground="#555").grid(row=4, column=0, columnspan=3, sticky="w", pady=(3, 0))
 
         controls = ttk.Frame(body)
         controls.pack(fill="x", pady=(0, 8))
@@ -249,6 +295,22 @@ class Launcher:
         self.log = tk.Text(body, height=16, wrap="word", state="disabled")
         self.log.pack(fill="both", expand=True)
         ttk.Label(body, text=tr(self.lang, "output_footer"), foreground="#555", wraplength=650).pack(anchor="w", pady=(8, 0))
+
+    def _jobs_value(self) -> int | None:
+        try:
+            return njobs.parse_jobs(self.jobs.get())
+        except njobs.JobsError:
+            return None
+
+    def _jobs_changed(self) -> None:
+        value = self._jobs_value()
+        self.jobs_summary.set(tr(self.lang, "jobs_summary", jobs=value, threads=self.plan.threads) if value else "")
+        self.jobs_priority.set(tr(self.lang, "build_priority", jobs=value if value else "?"))
+
+    def _save_jobs(self) -> None:
+        value = self._jobs_value()
+        if value is not None:
+            save_jobs_config(value, self.plan.jobs)
 
     def _language_changed(self, _event=None) -> None:
         selected = self.language_choice.get()
@@ -298,6 +360,14 @@ class Launcher:
         paths = self._validate(True)
         if paths is None:
             return
+        jobs = self._jobs_value()
+        if jobs is None:
+            messagebox.showerror(tr(self.lang, "jobs_invalid_title"), tr(self.lang, "jobs_invalid_gui"))
+            return
+        plan = njobs.default_plan()   # the RAM available now
+        for warning in njobs.render_warnings(self.lang, njobs.explicit_warnings(jobs, plan)):
+            self._append(warning + "\n")
+        self._save_jobs()
         builder, out = paths
         nup = pathlib.Path(self.nup.get()).expanduser()
         try:
@@ -328,7 +398,7 @@ class Launcher:
         except RuntimeError as exc:
             messagebox.showerror(tr(self.lang, "error_python_title"), str(exc))
             return
-        cmd = [python, str(builder), "--game", TITLE_ID, "build", str(nup), "--out", str(out), "--linux", "--jobs", "2"]
+        cmd = [python, str(builder), "--game", TITLE_ID, "build", str(nup), "--out", str(out), "--linux", "--jobs", str(jobs)]
         self._start(cmd, tr(self.lang, "status_building"), "build")
 
     def run(self) -> None:
@@ -473,6 +543,15 @@ class LocalizedArgumentParser(argparse.ArgumentParser):
         self.exit(2, tr(self.language, "cli_argument_error", error=message) + "\n")
 
 
+def jobs_argument(language: str):
+    def convert(text: str) -> int:
+        try:
+            return njobs.parse_jobs(text)
+        except njobs.JobsError as exc:
+            raise argparse.ArgumentTypeError(tr(language, "jobs.invalid", source="--jobs", value=exc.value)) from None
+    return convert
+
+
 def make_parser(language: str) -> argparse.ArgumentParser:
     parser = LocalizedArgumentParser(description=tr(language, "cli_description"), language=language)
     parser.add_argument("-h", "--help", action="help", help=tr(language, "cli_help_help"))
@@ -480,6 +559,7 @@ def make_parser(language: str) -> argparse.ArgumentParser:
     parser.add_argument("--check", metavar="NUP", help=tr(language, "cli_help_check"))
     parser.add_argument("--build", metavar="NUP", help=tr(language, "cli_help_build"))
     parser.add_argument("--out", metavar="DIR", help=tr(language, "cli_help_out"))
+    parser.add_argument("--jobs", "-j", metavar="N", type=jobs_argument(language), help=tr(language, "cli_help_jobs").replace("%", "%%"))
     return parser
 
 
@@ -496,6 +576,11 @@ def cli_main(argv: list[str] | None = None) -> int:
         Launcher(root, language=language)
         root.mainloop()
         return 0
+
+    try:
+        choice = njobs.resolve_jobs(args.jobs, saved=njobs.saved_jobs(load_language_config()))
+    except njobs.JobsError as exc:   # OOT_NATIVE_JOBS
+        parser.error(tr(language, "jobs.invalid", source=exc.source, value=exc.value))
 
     builder = DEFAULT_BUILDER
     if not builder.is_file():
@@ -538,7 +623,9 @@ def cli_main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError) as exc:
         print(str(exc) or tr(language, "error_build_unavailable"), file=sys.stderr)
         return 1
-    command = [python, str(builder), "--game", TITLE_ID, "build", str(nup), "--out", str(out), "--linux", "--jobs", "2"]
+    for warning in njobs.render_warnings(language, choice.warnings):
+        print(warning, file=sys.stderr)
+    command = [python, str(builder), "--game", TITLE_ID, "build", str(nup), "--out", str(out), "--linux", "--jobs", str(choice.jobs)]
     if shutil.which("nice") and shutil.which("ionice"):
         command = ["nice", "-n", "19", "ionice", "-c", "3", *command]
     try:

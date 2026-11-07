@@ -4,6 +4,7 @@ nup_dump.py
 nxs2.py
 nxs2_linux.py
 oot_native_i18n.py
+oot_native_jobs.py
 games/0400486024DEC000/game.tsv
 games/0400486024DEC000/profile.tsv
 games/0400486024DEC000/runtime_keys.tsv
@@ -34,5 +35,4 @@ windows/src/nxshader/nxshader.py
 ampere-lower/LICENSE
 ampere-lower/NOTICE.md
 release/GPL-3.0-or-later.txt
-release/README-RELEASE.md
 release/THIRD-PARTY-NOTICES.md

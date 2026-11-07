@@ -12,19 +12,9 @@ export NXS2_RELEASE_PACKAGE=1 NXS2_BIN="$BUILDER/bin" NXS2_LLD="$BUILDER/bin/ld.
 export NXS2_ZBIC_UNPACK="$BUILDER/bin/zbic-unpack" DOTNET_ROOT="$PKG/dotnet"
 export DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
 NXRT="$BUILDER/bin/nxrt"
-REFERENCE_NXRT="$OOT_REFERENCE_PACKAGE/builder/bin/nxrt"
+RELEASE_LABEL=${OOT_RELEASE_LABEL:-candidate}
+REFERENCE_NXRT=${OOT_REFERENCE_PACKAGE:+$OOT_REFERENCE_PACKAGE/builder/bin/nxrt}
 STATE=/tmp/oot-native-smoke/state
-
-require_root_space() {
-  local root=${OOT_HOST_ROOT:-/host-root} available_kb
-  [[ -d "$root" ]] || root=/
-  available_kb=$(df -Pk "$root" | awk 'NR==2 {print $4}')
-  df -h "$root"
-  if [[ ! "$available_kb" =~ ^[0-9]+$ ]] || (( available_kb < 12582912 )); then
-    echo 'FAIL: host / must retain at least 12 GiB free' >&2
-    exit 2
-  fi
-}
 
 (
   cd "$PKG"
@@ -73,7 +63,6 @@ echo 'PASS: nxrt reports built-in AV1 decoder capability without loading ExeFS'
 
 # Generate a tiny synthetic AV1 WebM in the clean smoke container; this contains
 # no game footage or data and exercises the same decoder path as the runtime.
-require_root_space
 ffmpeg -hide_banner -loglevel error -f lavfi -i 'color=c=blue:s=32x32:r=2:d=1' \
   -frames:v 2 -an -c:v libaom-av1 -cpu-used 8 -crf 45 -b:v 0 -y "$STATE/synthetic-av1.webm"
 mkdir -p "$STATE/synthetic-frames"
@@ -103,8 +92,13 @@ nxrt_backend_gate() {
 
 # No ExeFS argument is supplied: nxrt initializes only its host logger/address
 # space and reports backend selection. The reference is the released v0.1.0.
-nxrt_backend_gate 'v0.1.3' "$NXRT" "$STATE/v013-log"
-nxrt_backend_gate 'v0.1.0-reference' "$REFERENCE_NXRT" "$STATE/v010-log"
+nxrt_backend_gate "$RELEASE_LABEL" "$NXRT" "$STATE/candidate-log"
+if [[ -n "$REFERENCE_NXRT" ]]; then
+  # The previous release is a known-good Vulkan build: it proves this harness can pass a good binary.
+  nxrt_backend_gate 'previous-release-reference' "$REFERENCE_NXRT" "$STATE/reference-log"
+else
+  echo 'SKIP: previous-release-reference (no previous release package was given)'
+fi
 
 ldd_output=$(ldd "$NXRT" 2>&1) || { printf '%s\n' "$ldd_output" >&2; exit 1; }
 if grep -q 'not found' <<<"$ldd_output"; then
@@ -128,6 +122,18 @@ if (( probe_rc != 2 )) || ! grep -Fq 'usage: nxrt' <<<"$probe_output"; then
   exit 1
 fi
 echo 'PASS: Vulkan LD_PRELOAD constructor probe completed without a crash (nxrt usage rc=2)'
+
+# The runtime ABI report must work without a game: the pipeline's ABI gate reads it.
+set +e
+abi_output=$("$NXRT" --abi-info 2>"$STATE/abi-info.err")
+abi_rc=$?
+set -e
+printf '%s\n' "$abi_output" > "$STATE/abi-info.txt"
+if (( abi_rc != 0 )) || [[ "$(head -1 "$STATE/abi-info.txt")" != 'nxrt-abi-info 1' ]]; then
+  printf 'FAIL: nxrt --abi-info did not print its report (rc=%s):\n%s\n' "$abi_rc" "$(cat "$STATE/abi-info.err")" >&2
+  exit 1
+fi
+echo "PASS: nxrt --abi-info reports the runtime ABI ($(grep -c '^entry' "$STATE/abi-info.txt") registry entries); no game loaded"
 
 for license in \
   Python-libmpdec-BSD-2-Clause.txt Python-expat-MIT.txt Python-stdlib-third-party-licenses.rst \
@@ -163,7 +169,7 @@ import importlib, pathlib, sys
 root=pathlib.Path('/pkg/builder')
 sys.path[:0]=[str(root),str(root/'tools'),str(root/'windows/src/nxshader')]
 modules=(
-    'nxs2','nxs2_linux','oot_native_i18n','nup_dump','third_party.nup','third_party.nup.format',
+    'nxs2','nxs2_linux','oot_native_i18n','oot_native_jobs','nup_dump','third_party.nup','third_party.nup.format',
     'third_party.nup.read','tools.s2_pkg','tools.s2_ctl_scan','tools.s2_dumps',
     'tools.nso_tool','tools.make_ext_font','tools.epd_shaders','glslc2_extract',
     'tools.lower_corpus','nxshader','nxs_front','nxs_refl','nxs_spv',

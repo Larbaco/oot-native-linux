@@ -11,6 +11,7 @@ and nxshader to Vulkan SPIR-V.
   nxs2.py build <dump> [options]    the whole build into <dump folder>/<title>_native (or --out); the dump: a folder, or one .nup file (read directly, nothing extracted)
        --analyze-lift-only  only the ExeFS, nxanalyze and nxlift (Linux)
        --dumps DIR...    shader dumps from an earlier run (DM_NVN_SHDUMP folders) to include from the start
+       -j, --jobs N      parallel jobs (default: 90% of the available threads; or OOT_NATIVE_JOBS=N); --full-speed = every available thread
   nxs2.py run <build dir>                   play the built game
   nxs2.py status <build dir>                what the build folder holds and what it still lacks
 
@@ -20,6 +21,7 @@ cmake, ninja, git, curl, zstd, glslang and spirv-tools, and a Vulkan 1.3 driver.
 import argparse, concurrent.futures as cf, contextlib, fnmatch, hashlib, json, os, pathlib, platform, re, shutil, struct, subprocess, sys, time
 from oot_native_i18n import (DEFAULT_LANGUAGE, dump_error_key, normalize_language,
                              translate_builder_error, translate_builder_message, tr)
+import oot_native_jobs as njobs
 
 TOOL_VERSION = '0.1.0'
 DEFAULT_GAME = '0400486024DEC000'   # Ocarina of Time (Switch 2): what runs when no --game is given
@@ -59,6 +61,7 @@ def language(): return normalize_language(os.environ.get('OOT_NATIVE_LANG')) or 
 
 
 def say(msg): print(f'[{hms(time.time() - T0)}] {translate_builder_message(str(msg), language())}', flush=True)
+def say_tr(text): print(f'[{hms(time.time() - T0)}] {text}', flush=True)   # already in the interface language
 
 
 def run(cmd, log, env=None, cwd=None, ok=(0,), heartbeat=30, show=None):
@@ -181,14 +184,6 @@ def read_game_tsv(path):
 def build_id(nso):
     with open(nso, 'rb') as f:
         f.seek(0x40); return f.read(16).hex()
-
-
-def gentle_jobs():
-    """How many worker processes the build runs at once by default. Shader compiles keep every worker at 100 %, for half an hour or more: a long all-core load
-    that some machines do not take (13th and 14th generation Intel Core CPUs without Intel's 2024 microcode fix crash under it). The default leaves most of the
-    cores alone; --full-speed or -j N uses more."""
-    n = os.cpu_count() or 4
-    return max(2, min(8, n // 4))
 
 
 def lower_priority():
@@ -605,7 +600,9 @@ def build(args):
     b = Build(out); jobs = JOBS
     b.set_version(disp)
     say(f'OoT Native builder {TOOL_VERSION}: {NAME} {ver}: dump {exefs.parent}, build folder {b.out}')
-    say(f'load: {jobs} worker(s) of {os.cpu_count()} CPU threads, low priority' + ('' if args.full_speed or args.jobs else ' (gentle default; --full-speed uses them all)'))
+    say(f'load: {jobs} worker(s) of {JOBS_CHOICE.plan.threads} CPU threads, low priority' + {'cli': ' (--jobs)', 'env': f' ({njobs.ENV_VAR})', 'full': ' (--full-speed)', 'default': ' (default: 90% of the threads)'}.get(JOBS_CHOICE.source, ''))
+    for w in njobs.render_warnings(language(), JOBS_CHOICE.warnings):
+        if os.environ.get('OOT_NATIVE_LAUNCHER') != '1': say_tr(w)   # the launcher has already shown them
     free = shutil.disk_usage(b.out).free / 1_000_000_000
     if free < 45 and not b.romfs_img.is_file(): say(f'WARNING: {free:.0f} GB free where the build folder is; reserve at least 45 GB (the measured OoT build used 38G)')
     st_profile(b)
@@ -644,7 +641,7 @@ def main():
     sub = ap.add_subparsers(dest='cmd', required=True)
     ap.add_argument('--version', action='version', version=f'OoT Native builder {TOOL_VERSION}')
     s = sub.add_parser('setup'); s.set_defaults(f=setup)
-    s = sub.add_parser('doctor'); s.add_argument('--release', action='store_true', help='check only end-user runtime requirements'); s.add_argument('--json', action='store_true'); s.add_argument('--out', help='check disk space on this build destination'); s.set_defaults(f=run_doctor)
+    s = sub.add_parser('doctor'); s.add_argument('--release', action='store_true', help='check only end-user runtime requirements'); s.add_argument('--json', action='store_true'); s.add_argument('--out', help='check disk space on this build destination'); s.add_argument('-j', '--jobs', type=jobs_arg, help='build jobs to check the RAM against (default: as for build)'); s.set_defaults(f=run_doctor)
     s = sub.add_parser('check-dump', help='quickly validate a user-owned .nup without extracting or modifying it')
     s.add_argument('dump'); s.add_argument('--json', action='store_true'); s.set_defaults(f=check_dump)
     s = sub.add_parser('build')
@@ -654,8 +651,8 @@ def main():
     s.add_argument('--analyze-lift-only', action='store_true', help='only the ExeFS, nxanalyze and nxlift (no RomFS image, no shader corpus, shaders, fonts or launcher)')
     s.add_argument('--detach-lift', action='store_true', help='with --analyze-lift-only: start nxlift detached (setsid, nohup) and return')
     s.add_argument('--dumps', nargs='*', default=[], help='shader dumps from an earlier run (DM_NVN_SHDUMP folders)')
-    s.add_argument('-j', '--jobs', type=int, help='worker processes at once (default: a quarter of the CPU threads, at most 8)')
-    s.add_argument('--full-speed', action='store_true', help='every CPU thread (fastest; a long all-core load)')
+    s.add_argument('-j', '--jobs', type=jobs_arg, help=f'worker processes at once, a whole number of 1 or more (default: 90%% of the available threads; or set {njobs.ENV_VAR})')
+    s.add_argument('--full-speed', action='store_true', help='every available thread (100%%) instead of the 90%% default; -j N wins over it')
     s.set_defaults(f=build)
     s = sub.add_parser('run'); s.add_argument('build'); s.add_argument('env', nargs='*', help='switches for the launcher (--fullscreen, --window WxH, --silent, --gamemode)'); s.set_defaults(f=run_linux)
     s = sub.add_parser('status'); s.add_argument('build'); s.set_defaults(f=status)
@@ -664,8 +661,11 @@ def main():
     try: select_game(a.game)
     except Fail as e: print(f'\n[FAIL] {translate_builder_error(str(e), language())}', file=sys.stderr); sys.exit(1)
     if a.cmd == 'build' and not (a.dump or (a.exefs and a.romfs)): ap.error('build needs the dump folder or .nup file, or --exefs and --romfs')
-    global JOBS
-    JOBS = max(1, getattr(a, 'jobs', None) or ((os.cpu_count() or 4) if getattr(a, 'full_speed', False) else gentle_jobs()))
+    global JOBS, JOBS_CHOICE
+    if a.cmd in ('build', 'doctor'):
+        try: JOBS_CHOICE = pick_jobs(a)
+        except njobs.JobsError as e: ap.error(tr(language(), 'jobs.invalid', source=e.source, value=e.value))
+        JOBS = JOBS_CHOICE.jobs
     if a.cmd in ('setup', 'build'): lower_priority()
     try:
         rc = a.f(a)
@@ -674,11 +674,39 @@ def main():
     except KeyboardInterrupt: print('\n' + tr(language(), 'builder_interrupted'), file=sys.stderr); sys.exit(130)
 
 
+def jobs_arg(text):
+    try: return njobs.parse_jobs(text)
+    except njobs.JobsError: raise argparse.ArgumentTypeError(tr(language(), 'jobs.invalid', source='--jobs', value=text))
+
+
+def pick_jobs(a):
+    """--jobs > OOT_NATIVE_JOBS > --full-speed > the 90 % default (oot_native_jobs.default_jobs, the one rule the launcher uses too). Warns (never refuses) when the choice passes
+    the threads or the memory ceiling. The shader compiles keep every worker at 100 % for a long time, a long all-core load that some machines do not take (13th and 14th
+    generation Intel Core CPUs without Intel's 2024 microcode fix crash under it): -j N or OOT_NATIVE_JOBS=N uses fewer."""
+    plan = njobs.default_plan()
+    if getattr(a, 'full_speed', False) and getattr(a, 'jobs', None) is None and not (os.environ.get(njobs.ENV_VAR) or '').strip():
+        c = njobs.JobsChoice(plan.threads, 'full', plan, njobs.explicit_warnings(plan.threads, plan))
+    else: c = njobs.resolve_jobs(getattr(a, 'jobs', None), plan=plan)
+    return c
+
+
+def release_resources(jobs_choice):
+    """Threads, default jobs and available RAM for the release doctor, and the RAM warning when a per-job estimate says the jobs will not fit."""
+    p = jobs_choice.plan
+    ram = p.mem_available
+    return {'threads': p.threads, 'default_jobs': p.jobs, 'jobs': jobs_choice.jobs, 'mem_available_gb': None if ram is None else round(ram / 1e9, 1),
+            'mem_per_job_gb': None if p.mem_per_job is None else round(p.mem_per_job / 1e9, 1), 'low_memory': njobs.low_memory(jobs_choice.jobs, p)}
+
+
 def run_doctor(args):
     if args.release:
         checks = lx().release_checks(sys.modules[__name__], args.out)
-        if args.json: print(json.dumps({'ok': all(c['ok'] for c in checks), 'checks': checks}, ensure_ascii=False))
+        res = release_resources(JOBS_CHOICE)
+        if args.json: print(json.dumps({'ok': all(c['ok'] for c in checks), 'checks': checks, 'resources': res}, ensure_ascii=False))
         else:
+            ram = tr(language(), 'doctor.ram_unknown') if res['mem_available_gb'] is None else f"{res['mem_available_gb']:.1f} GB"
+            print(f"  {'info':8} " + tr(language(), 'doctor.resources', threads=res['threads'], default=res['default_jobs'], jobs=res['jobs'], ram=ram))
+            if res['low_memory']: print(f"  {'warning':8} " + tr(language(), 'doctor.warn_ram', jobs=res['jobs'], ram=ram))
             for c in checks:
                 label = tr(language(), 'doctor.' + c.get('code', ''))
                 values = {'available': c.get('available_gb', '?')} if c.get('code') == 'space_45gb' else {}
@@ -728,5 +756,6 @@ def classify_dump_error(message, exc=None):
 
 
 VERBOSE = False
-JOBS = 4   # set in main() from -j / --full-speed / gentle_jobs()
+JOBS = 4   # set in main() from -j / OOT_NATIVE_JOBS / --full-speed / default_jobs()
+JOBS_CHOICE = None   # the njobs.JobsChoice behind JOBS
 if __name__ == '__main__': main()

@@ -143,6 +143,24 @@ void nxrt_hle_get_stats(nxrt_hle_stats *o) {
     }
     o->named_stubs = (int)g_nstub; o->bound_relocs = g_bound_relocs;
 }
+// `nxrt --abi-info`: the runtime ABI as this binary was compiled, one fact per line, without reserving memory or loading a game (release/release_abi.py reads it).
+// Read-only: it prints compile-time constants and the generated registry; the ABI itself is untouched.
+void nxrt_abi_info(FILE *out) {
+    fprintf(out, "nxrt-abi-info 1\n");
+    fprintf(out, "abi_version %d\n", NXW_ABI_VERSION);
+    fprintf(out, "guest_cpu_size %zu\n", sizeof(NxwGuestCpu));
+    fprintf(out, "token_base %#llx\n", (unsigned long long)NXRT_TOKEN_BASE);
+    fprintf(out, "token_size %#llx\n", (unsigned long long)NXRT_TOKEN_SIZE);
+    fprintf(out, "token_stride %u\n", (unsigned)NXRT_TOKEN_STRIDE);
+    fprintf(out, "module_base %#llx\n", (unsigned long long)NXRT_MODULE_BASE);
+    fprintf(out, "module_region_size %#llx\n", (unsigned long long)NXRT_MODULE_REGION_SIZE);
+    fprintf(out, "guest_as_base %#llx\n", (unsigned long long)NXRT_GUEST_AS_BASE);
+    fprintf(out, "token_capacity %u\n", (unsigned)MAX_TOKEN);
+    fprintf(out, "stub_capacity %u\n", (unsigned)MAX_STUB);
+    fprintf(out, "registry_count %u\n", nxrt_hle_count);
+    for (unsigned i = 0; i < nxrt_hle_count; i++)
+        fprintf(out, "entry\t%u\t%s\t%u\t%u\n", i, nxrt_hle_table[i].name, (unsigned)nxrt_hle_table[i].kind, (unsigned)nxrt_hle_table[i].ported);
+}
 // How often each host replacement ran (the log at exit, and tests)
 uint32_t nxrt_hle_calls(const char *name) { unsigned k = idx_find(name); return k ? atomic_load(&g_tok[k].calls) : 0; }
 // The generated stubs' log: once per name, with the guest call site

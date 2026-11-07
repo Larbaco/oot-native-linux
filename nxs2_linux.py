@@ -4,7 +4,7 @@ The same recompiled game as on Windows, built and run with Linux's own tools: nx
 as an ordinary executable over pthreads and mmap, SDL3 and Vulkan as in any Linux game. Nothing of Windows or macOS is emulated: no Wine, no DXVK, no translation layer.
 The shader translator is a .NET assembly, which is portable code: .NET's own Linux runtime runs the same file the Windows build uses.
 """
-import os, pathlib, platform, re, shlex, shutil, subprocess, sys
+import hashlib, os, pathlib, platform, re, shlex, shutil, subprocess, sys
 from oot_native_i18n import DEFAULT_LANGUAGE, normalize_language, tr
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -14,6 +14,20 @@ LLVM = TOOLCHAINS / 'llvm-23.1.4'; SDL3 = TOOLCHAINS / 'SDL3-3.4.18'; VK = TOOLC
 URL_LLVM = 'https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.4/LLVM-23.1.4-Linux-X64.tar.zst'
 URL_SDL3 = 'https://github.com/libsdl-org/SDL/releases/download/release-3.4.18/SDL3-3.4.18.tar.gz'
 URL_VK = 'https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v1.4.367.tar.gz'
+# Every toolchain download is verified against these SHA-256 values (release/pins.env carries the same pins; a unit test keeps them equal).
+# NXS2_DOWNLOADS=<folder> supplies already-fetched copies by file name, so a release build needs no network for them.
+PINNED_DOWNLOADS = {
+    URL_LLVM: ('LLVM-23.1.4-Linux-X64.tar.zst', 'efdd1dbd089b99bfcfcde7b8eb1236163f2e88df5a981cca4f783ec9cb5e0378'),
+    URL_SDL3: ('SDL3-3.4.18.tar.gz', '9c75cf16330322c217dedd2e0609f1124f1b54b8633e763467b4684d0f4334a3'),
+    URL_VK: ('Vulkan-Headers-v1.4.367.tar.gz', '0df7d58b5df617e0a6a17dec521af459206719f9c7cb12d05d09275597c16f70'),
+}
+
+
+def verify_sha256(path, expected):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''): h.update(chunk)
+    if h.hexdigest() != expected: raise RuntimeError(f'{path}: SHA-256 {h.hexdigest()} != pinned {expected}')
 
 
 def build_dir(n):
@@ -24,7 +38,8 @@ def build_dir(n):
 def build_jobs(default=None):
     try: requested = int(os.environ.get('NXS2_JOBS') or 0)
     except ValueError: requested = 0
-    return max(1, min(12, requested or default or max(2, (os.cpu_count() or 4) // 2)))
+    import oot_native_jobs as njobs   # the one 90%-of-the-threads rule shared with the launcher and nxs2.py
+    return max(1, requested or default or njobs.default_jobs())
 
 
 def tools(n):
@@ -161,7 +176,15 @@ def release_checks(n, build_dir=None):
 def fetch_toolchain(n):
     """What the tools are built with, into toolchains/ (nothing system-wide): LLVM 23.1.4 (the recompiler is built on its libraries), SDL3 3.4.18, the Vulkan headers."""
     TOOLCHAINS.mkdir(parents=True, exist_ok=True)
-    def get(url, out): n.run(['curl', '-fL', '--retry', '3', '-o', out, url], HERE / 'setup-fetch.log', heartbeat=60)
+    def get(url, out):
+        name, expected = PINNED_DOWNLOADS[url]
+        have = pathlib.Path(os.environ.get('NXS2_DOWNLOADS') or '') / name
+        if os.environ.get('NXS2_DOWNLOADS') and have.is_file(): shutil.copyfile(have, out)
+        else: n.run(['curl', '-fL', '--retry', '3', '-o', out, url], HERE / 'setup-fetch.log', heartbeat=60)
+        try: verify_sha256(out, expected)
+        except RuntimeError as e:
+            pathlib.Path(out).unlink(missing_ok=True)
+            raise n.Fail(f'refusing an unverified download: {e}')
     if not (LLVM / 'bin/clang').is_file():
         n.say('fetching LLVM 23.1.4 (1.2 GB, 12 GB unpacked)')
         tar = TOOLCHAINS / 'LLVM.tar.zst'; get(URL_LLVM, tar); LLVM.mkdir(exist_ok=True)

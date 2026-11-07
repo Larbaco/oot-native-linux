@@ -1,4 +1,4 @@
-# OoT Native Linux x86-64 — v0.1.3 (WIP)
+# OoT Native Linux x86-64 — v0.1.4 (WIP)
 
 ## English
 
@@ -19,16 +19,31 @@ and takes effect on the next start. For the CLI, use
 `--lang en` or `--lang pt-BR`, or set `OOT_NATIVE_LANG=en|pt-BR`. The system
 locale does not change the default language.
 
-Version 0.1.3 bundles FFmpeg 7.1.1 with dav1d 1.5.1 for AV1 movie decoding.
+Version 0.1.4 bundles FFmpeg 7.1.1 with dav1d 1.5.1 for AV1 movie decoding.
 Decoding is enabled by default; set `NXRT_MOVIE_DECODE=0` to use the timed
 no-image fallback. The exact source tarballs are in the adjacent
-`oot-native-linux-x86_64-v0.1.3-2026-11-07-thirdparty-source.tar.xz` archive.
-See `TESTER-v0.1.3.md` to test with an existing build without rebuilding it.
+`oot-native-linux-x86_64-v0.1.4-2026-11-07-thirdparty-source.tar.xz` archive.
+See `TESTER-v0.1.4.md` to test with an existing build without rebuilding it.
 
 ```sh
 ./oot-native-launcher --check "/path/to/your-dump.nup"
 ./oot-native-launcher --build "/path/to/your-dump.nup" --out "$HOME/Games/oot-native-build"
 ```
+
+**Build jobs.** The build runs in parallel and by default uses **90% of the
+available threads** (rounded down, at least 1): the CPUs the process may run on
+(its affinity, so `taskset` and containers count), lowered further by a cgroup
+v2 CPU quota (`/sys/fs/cgroup/cpu.max`) if that allows fewer. Use `--jobs N` or
+`OOT_NATIVE_JOBS=N` to change it, for example
+`./oot-native-launcher --build "/path/to/your-dump.nup" --out "$HOME/Games/oot-native-build" --jobs 6`.
+The GUI has a **Build jobs** field that shows the default and "Using N of M
+threads"; its value is saved in `launcher.json` next to the language. Order:
+`--jobs`, then `OOT_NATIVE_JOBS`, then the GUI's saved value, then the 90%
+default. `N` is a whole number of 1 or more; more than the available threads is
+accepted with a warning. The build always runs at low priority (`nice -n 19`,
+`ionice -c3`). The default is a long load on almost every thread: choose fewer
+jobs if your machine overheats or becomes unstable. The shader step uses at most
+8 workers whatever the setting.
 
 Shader inventory `glob` rows are patterns matched against RomFS paths; a row
 with no matches produces a warning. The RomFS marker, explicit `bfsha`/`sarc`
@@ -42,7 +57,7 @@ the .NET 10 runtime and enables invariant globalization, so system .NET and ICU
 are not required. Reserve at least **45 GB free** on the build destination's
 disk; the measured build directory used 38 GB. With 2 jobs, measured total build
 time was about **2h25** and peak memory was **4.5 GB RSS** (a 35m17s failed first
-attempt plus a successful 1h49m54s resume). The doctor checks the selected
+attempt plus a successful 1h49m54s resume). The time and memory above were measured with **2 jobs**, the fixed setting of earlier releases, not with the new default. With more jobs the build should finish sooner and use more RAM; no figures were measured for other job counts. The doctor checks the selected
 destination. The package includes its DejaVu Sans font and requires no
 development toolchains on the user's machine.
 
@@ -84,16 +99,32 @@ e passa a valer na próxima inicialização. Na CLI, use
 `--lang en` ou `--lang pt-BR`, ou defina `OOT_NATIVE_LANG=en|pt-BR`. O locale
 do sistema não altera o idioma padrão.
 
-O v0.1.3 inclui FFmpeg 7.1.1 com dav1d 1.5.1 para decodificar vídeos AV1. A
+O v0.1.4 inclui FFmpeg 7.1.1 com dav1d 1.5.1 para decodificar vídeos AV1. A
 decodificação fica ativa por padrão; defina `NXRT_MOVIE_DECODE=0` para usar o
 fallback temporizado sem imagem. Os tarballs exatos do código-fonte estão no
-arquivo adjacente `oot-native-linux-x86_64-v0.1.3-2026-11-07-thirdparty-source.tar.xz`.
-Consulte `TESTER-v0.1.3.md` para testar com um build existente, sem recompilá-lo.
+arquivo adjacente `oot-native-linux-x86_64-v0.1.4-2026-11-07-thirdparty-source.tar.xz`.
+Consulte `TESTER-v0.1.4.md` para testar com um build existente, sem recompilá-lo.
 
 ```sh
 ./oot-native-launcher --check "/caminho/do/seu-dump.nup"
 ./oot-native-launcher --build "/caminho/do/seu-dump.nup" --out "$HOME/Games/oot-native-build"
 ```
+
+**Jobs da build.** A build roda em paralelo e, por padrão, usa **90% das
+threads disponíveis** (arredondado para baixo, no mínimo 1): as CPUs em que o
+processo pode rodar (sua affinity, então `taskset` e containers contam),
+reduzidas ainda mais por uma cota de CPU do cgroup v2 (`/sys/fs/cgroup/cpu.max`)
+se ela permitir menos. Use `--jobs N` ou `OOT_NATIVE_JOBS=N` para mudar, por
+exemplo
+`./oot-native-launcher --build "/caminho/do/seu-dump.nup" --out "$HOME/Games/oot-native-build" --jobs 6`.
+A GUI tem o campo **Jobs da build**, que mostra o padrão e "Usando N de M
+threads"; o valor é salvo no `launcher.json`, junto com o idioma. Ordem:
+`--jobs`, depois `OOT_NATIVE_JOBS`, depois o valor salvo pela GUI, depois o
+padrão de 90%. `N` é um inteiro maior ou igual a 1; mais que as threads
+disponíveis é aceito com um aviso. A build sempre roda com prioridade baixa
+(`nice -n 19`, `ionice -c3`). O padrão é uma carga longa em quase todas as
+threads: escolha menos jobs se a máquina esquentar ou ficar instável. A etapa de
+shaders usa no máximo 8 workers, qualquer que seja o valor.
 
 As linhas `glob` do inventário de shaders são padrões aplicados aos nomes do
 RomFS: uma linha sem correspondências gera aviso. Marcador RomFS, arquivos
@@ -107,7 +138,7 @@ runtime .NET 10 e ativa globalização invariante, sem exigir .NET ou ICU no
 sistema. Reserve pelo menos **45 GB livres** no disco do destino: a pasta de
 build medida ocupou 38 GB. Com 2 jobs, o tempo total medido foi cerca de **2h25**
 e o pico de memória **4,5 GB RSS** (primeira tentativa interrompida após 35m17s
-mais retomada bem-sucedida de 1h49m54s). O doctor verifica o destino selecionado.
+mais retomada bem-sucedida de 1h49m54s). O tempo e a memória acima foram medidos com **2 jobs**, a configuração fixa dos releases anteriores, e não com o novo padrão. Com mais jobs a build deve terminar antes e usar mais RAM; não foram medidos números para outras quantidades de jobs. O doctor verifica o destino selecionado.
 O pacote inclui a fonte DejaVu Sans usada no build e não instala toolchains de
 desenvolvimento.
 

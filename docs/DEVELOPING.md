@@ -93,8 +93,9 @@ This reads only the dump's table of contents and the build IDs. Nothing is extra
 nice -n 19 .venv/bin/python nxs2.py build "/path/to/your dump.nup" --out ~/Games/oot_native
 ```
 
-The first build takes about 30 minutes on 8 threads. Use `NXS2_JOBS=<n>` to limit the parallel jobs, and `taskset -c 0-7` to
-pin the build to specific CPUs. Later builds redo only what changed. Use `-v` to see every line the tools print. Full logs are
+The first build takes about 30 minutes on 8 threads. The game build uses 90% of the available threads by default (`oot_native_jobs.py`); use `-j N` or `OOT_NATIVE_JOBS=N` to change it
+(`--full-speed` uses every available thread), and `taskset -c 0-7` to pin the build to specific CPUs, which also lowers the
+thread count the default is computed from. `NXS2_JOBS=<n>` only limits the tool compile in `nxs2.py setup`. Later builds redo only what changed. Use `-v` to see every line the tools print. Full logs are
 in `<build>/logs/`.
 
 The build folder holds data derived from the game (`game.so`, the RomFS image, translated shaders).
