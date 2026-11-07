@@ -59,3 +59,10 @@ corresponding-source archive.
   license. System glibc, Vulkan loader/driver, display server, and audio
   libraries are provided by the operating system. X11-related libraries
   embedded in the launcher have separate copyright texts listed above.
+- AMD FidelityFX FSR1 headers `ffx_a.h` and `ffx_fsr1.h` (opt-in present upscaler)
+  are MIT-licensed, copyright 2021 Advanced Micro Devices, Inc. The full notice is
+  in `LICENSES/FidelityFX-FSR1-MIT.txt` and alongside the headers under
+  `windows/src/nxrt/vk/shaders/ffx/`.
+- The FSR shader wrappers are derived from sostenesfreitas/ocarina-recomp at
+  `f328427034dd3e8b2b2cc5e15ed13da6304d392b`, GPL-3.0-or-later; see
+  `windows/docs/PROVENANCE.md`. Release binaries are GPL-3.0-or-later.

@@ -6,9 +6,11 @@
 
 typedef struct audio_dev audio_dev;
 typedef void (*audio_pull_fn)(void *ctx, uint8_t *dst, uint64_t bytes);   // fills bytes of interleaved PCM16; never blocks, never logs
+typedef uint32_t (*audio_ready_fn)(void *ctx);   // frames the owner has queued right now: a pull of up to that many pads nothing; never blocks
 typedef struct audio_out_backend {
     const char *name;
-    audio_dev *(*open)(int channels, int rate, audio_pull_fn pull, void *ctx);   // NULL when it cannot open
+    // NULL when it cannot open. ready may be NULL; with it, a device that asks for more at once than the owner keeps queued can hold a reserve (audio_sdl.c)
+    audio_dev *(*open)(int channels, int rate, audio_pull_fn pull, audio_ready_fn ready, void *ctx);
     int (*start)(audio_dev *d);                                                  // 0 = pulling
     void (*stop)(audio_dev *d);                                                  // returns once no pull is running or will run
     void (*close)(audio_dev *d);

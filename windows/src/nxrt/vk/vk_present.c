@@ -1,10 +1,12 @@
 // The swapchain and the present thread (vk_present.h; docs/m5-vulkan.md §2.3). Behaviour follows nxnative's present queue (nvn_mtl.m present_enqueue,
 // mtl_present_wait: a ticket per present, the game's acquire waits for its texture's last ticket); the Vulkan side is written from the specification.
 #include "vk_present.h"
+#include "vk_fsr.h"
 #include "vk_submit.h"
 #include "vk_window.h"
 #include "present_vert.h"
 #include "present_frag.h"
+#include "present_color_frag.h"
 #include <math.h>
 #ifdef _WIN32
 #include <process.h>
@@ -30,6 +32,7 @@ static struct {
     double st_iv[STAT_N]; int st_n; uint64_t st_t0, last_t, acq_ns, src_frames, pattern_frames;
     // capture
     _Atomic int cap_want; int cap_ok, cap_w, cap_h; VkBuffer cap_buf; vk_alloc cap_mem; plat_event *cap_ev; uint32_t *cap_px;
+    int fsr, color; float fsr_sharpness, gamma, brightness, saturation;
     int sharp; float sharpness;   // NXRT_VK_UPSCALE=sharp (the default) / standard, NXRT_VK_SHARPNESS 0..1: present.frag's sharp upscale when the window is larger
 } g_p;
 
@@ -43,7 +46,7 @@ static VkShaderModule shader(const uint32_t *code, size_t bytes) {
 static int make_pipeline(VkFormat fmt) {
     if (g_p.pipe && g_p.pipe_fmt == fmt) return 0;
     if (g_p.pipe) { vkDestroyPipeline(g_vk.dev, g_p.pipe, NULL); g_p.pipe = VK_NULL_HANDLE; }
-    VkShaderModule vs = shader(present_vert_spv, sizeof present_vert_spv), fs = shader(present_frag_spv, sizeof present_frag_spv);
+    VkShaderModule vs = shader(present_vert_spv, sizeof present_vert_spv), fs = g_p.color ? shader(present_color_frag_spv, sizeof present_color_frag_spv) : shader(present_frag_spv, sizeof present_frag_spv);
     VkPipelineShaderStageCreateInfo st[2] = {
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, vs, "main", NULL},
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fs, "main", NULL}};
@@ -192,12 +195,21 @@ static int present_one(const pq_item *it) {
     VkRect2D sc = {{(int32_t)vp.x, (int32_t)vp.y}, {(uint32_t)vw, (uint32_t)vh}};
     VkDescriptorImageInfo dii = {g_p.samp, have ? src.view : g_p.dummy_view, have ? src.layout : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, f->ds, 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &dii, NULL, NULL};
-    vkUpdateDescriptorSets(g_vk.dev, 1, &w, 0, NULL);
     if (have) g_p.src_frames++; else g_p.pattern_frames++;
 
     vkResetCommandPool(g_vk.dev, f->pool, 0);
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL};
     vkBeginCommandBuffer(f->cb, &bi);
+    int fsr_used = 0;
+    if (g_p.fsr && have && s > 1.01f && fminf(u0,u1) >= 0 && fminf(v0,v1) >= 0 && fmaxf(u0,u1) <= 1 && fmaxf(v0,v1) <= 1) {
+        float cropx = roundf(fminf(u0, u1) * src.w), cropy = roundf(fminf(v0, v1) * src.h);
+        VkImageView result = vkfs_record(f->cb, (unsigned)(f - g_p.fr), src.view, src.layout,
+                                         (float)src.w, (float)src.h, cropx, cropy, pw, ph,
+                                         (uint32_t)vw, (uint32_t)vh, g_p.fsr_sharpness);
+        if (result) { dii.imageView = result; dii.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            u0 = 0; u1 = 1; v0 = it->flip ? 1 : 0; v1 = it->flip ? 0 : 1; fsr_used = 1; }
+    }
+    vkUpdateDescriptorSets(g_vk.dev, 1, &w, 0, NULL);
     vk_image_barrier(f->cb, g_p.img[idx], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, 0, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
     VkRenderingAttachmentInfo ca = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, NULL, g_p.view[idx], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0, VK_NULL_HANDLE,
@@ -207,9 +219,9 @@ static int present_one(const pq_item *it) {
     vkCmdBindPipeline(f->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_p.pipe);
     vkCmdSetViewport(f->cb, 0, 1, &vp); vkCmdSetScissor(f->cb, 0, 1, &sc);
     vkCmdBindDescriptorSets(f->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_p.pl, 0, 1, &f->ds, 0, NULL);
-    float mode = !have ? 1.0f : g_p.sharp && s > 1.01f ? 2.0f : 0.0f;
-    float pc[12] = {u0, v0, u1, v1, mode, (float)(atomic_load(&g_p.count) + 1), pw, ph, g_p.sharpness, 0, 0, 0};
-    vkCmdPushConstants(f->cb, g_p.pl, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, pc);
+    float mode = !have ? 1.0f : !fsr_used && g_p.sharp && s > 1.01f ? 2.0f : 0.0f;
+    float pc[16] = {u0, v0, u1, v1, mode, (float)(atomic_load(&g_p.count) + 1), pw, ph, g_p.sharpness, (float)g_p.color, g_p.brightness, g_p.saturation, g_p.gamma, 0, 0, 0};
+    vkCmdPushConstants(f->cb, g_p.pl, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, g_p.color ? sizeof pc : 48, pc);
     vkCmdDraw(f->cb, 3, 1, 0, 0);
     vkCmdEndRendering(f->cb);
     int cap = atomic_load(&g_p.cap_want) && g_p.cap_ok && g_p.cap_buf;
@@ -226,7 +238,7 @@ static int present_one(const pq_item *it) {
     vkEndCommandBuffer(f->cb);
 
     VkSemaphoreSubmitInfo wait[2] = {{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, NULL, f->acq, 0, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, 0},
-                                     {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, NULL, g_vk.tl, it->wait_value, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0}};
+                                     {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, NULL, g_vk.tl, it->wait_value, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | (g_p.fsr ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT : 0), 0}};
     VkSemaphoreSubmitInfo sig = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, NULL, g_p.rdone[idx], 0, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0};
     VkCommandBufferSubmitInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, NULL, f->cb, 0};
     VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2, NULL, 0, it->wait_value ? 2u : 1u, wait, 1, &cbi, 1, &sig};
@@ -298,7 +310,24 @@ int vkp_init(int mode) {
     VkDescriptorSetLayoutBinding b = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
     VkDescriptorSetLayoutCreateInfo dl = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 1, &b};
     vkCreateDescriptorSetLayout(g_vk.dev, &dl, NULL, &g_p.dsl);
-    VkPushConstantRange pcr = {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 48};
+    VkPushConstantRange pcr = {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 64};
+    const char *fsr = getenv("NXRT_FSR");
+    g_p.fsr = fsr && !strcmp(fsr, "1");
+    const char *val = getenv("NXRT_FSR_SHARPNESS");
+    g_p.fsr_sharpness = val ? strtof(val, NULL) : 0.0f;
+    if (!isfinite(g_p.fsr_sharpness)) g_p.fsr_sharpness = 0;
+    g_p.fsr_sharpness = fminf(1, fmaxf(0, g_p.fsr_sharpness));
+    val = getenv("NXRT_COLOR_GAMMA"); g_p.gamma = val ? strtof(val, NULL) : 1;
+    val = getenv("NXRT_COLOR_BRIGHTNESS"); g_p.brightness = val ? strtof(val, NULL) : 1;
+    val = getenv("NXRT_COLOR_SATURATION"); g_p.saturation = val ? strtof(val, NULL) : 1;
+    if (!isfinite(g_p.gamma) || g_p.gamma <= 0) g_p.gamma = 1;
+    if (!isfinite(g_p.brightness) || g_p.brightness < 0) g_p.brightness = 1;
+    if (!isfinite(g_p.saturation) || g_p.saturation < 0) g_p.saturation = 1;
+    g_p.color = g_p.gamma != 1 || g_p.brightness != 1 || g_p.saturation != 1;
+    if (g_p.fsr && !vkfs_init()) { VKRED("FSR unavailable, using the standard present path"); g_p.fsr = 0; }
+    if (g_p.fsr) VKLOG("present: FSR1 enabled, RCAS sharpness %.2f", g_p.fsr_sharpness);
+    if (!g_p.color) pcr.size = 48;
+    if (g_p.color) VKLOG("present: color gamma %.2f brightness %.2f saturation %.2f", g_p.gamma, g_p.brightness, g_p.saturation);
     const char *e = getenv("NXRT_VK_UPSCALE"); g_p.sharp = !(e && !strcmp(e, "standard"));
     e = getenv("NXRT_VK_SHARPNESS"); g_p.sharpness = e && *e ? (float)atof(e) : 0.5f;
     if (g_p.sharpness < 0) g_p.sharpness = 0; else if (g_p.sharpness > 1) g_p.sharpness = 1;
@@ -359,6 +388,7 @@ void vkp_shutdown(void) {
     for (int i = 0; i < NFR; i++) { frame_t *f = &g_p.fr[i]; vkDestroyCommandPool(g_vk.dev, f->pool, NULL); vkDestroySemaphore(g_vk.dev, f->acq, NULL); vkDestroyFence(g_vk.dev, f->fence, NULL); }
     destroy_swapchain_views();
     if (g_p.sc) vkDestroySwapchainKHR(g_vk.dev, g_p.sc, NULL);
+    if (g_p.fsr) vkfs_shutdown();
     if (g_p.pipe) vkDestroyPipeline(g_vk.dev, g_p.pipe, NULL);
     vkDestroyPipelineLayout(g_vk.dev, g_p.pl, NULL); vkDestroyDescriptorPool(g_vk.dev, g_p.dp, NULL); vkDestroyDescriptorSetLayout(g_vk.dev, g_p.dsl, NULL);
     vkDestroySampler(g_vk.dev, g_p.samp, NULL); vkDestroyImageView(g_vk.dev, g_p.dummy_view, NULL); vkDestroyImage(g_vk.dev, g_p.dummy, NULL); vk_free_mem(&g_p.dummy_mem);

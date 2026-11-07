@@ -65,13 +65,19 @@ function(nxrt_executable name)
   if(WIN32)
     target_link_options(${name} PRIVATE -Xlinker /HIGHENTROPYVA:NO $<$<BOOL:${NXRT_PDB}>:-g>)
   else()
+    # exports: only what game.so imports, rt_* and adapter_* (plat/linux/nxrt.dynlist; pokopia-native 56be9d2, #30)
+    target_link_options(${name} PRIVATE "-Wl,--dynamic-list=${CMAKE_CURRENT_FUNCTION_LIST_DIR}/plat/linux/nxrt.dynlist")
     set_target_properties(${name} PROPERTIES BUILD_RPATH "$ORIGIN")   # libSDL3.so.0 beside the program
   endif()
   set_target_properties(${name} PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
 endfunction()
 
 nxrt_executable(nxrt tools/nxrt_main.c)
-set_target_properties(nxrt PROPERTIES ENABLE_EXPORTS ON)   # Windows: nxrt.lib, what the game DLL links against; Linux: the rt_* symbols the game's shared object binds to at load
+if(WIN32)
+  set_target_properties(nxrt PROPERTIES ENABLE_EXPORTS ON)   # nxrt.lib, what the game DLL links against
+else()   # Linux: the rt_* / adapter_* the game's shared object binds to at load come from the dynamic list; ENABLE_EXPORTS would add --export-dynamic past it
+  add_test(NAME nxrt.exports COMMAND ${CMAKE_COMMAND} -DNM=${CMAKE_NM} -DEXE=$<TARGET_FILE:nxrt> -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_exports.cmake)
+endif()
 
 # The tests that exercise Win32 specifics stay on Windows; on Linux the runtime is checked by its self-contained tests and by running the game
 if(NOT WIN32)

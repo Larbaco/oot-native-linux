@@ -55,8 +55,8 @@ int main(void) {
     /* 1. the sink on its own */
     const audio_out_backend *s = audio_out_silent();
     T(s);   /* audio_out_device(): the SDL3 sound card when built with SDL3 (test_audio_sdl.c), else none */
-    audio_dev *d = s->open(2, 48000, count_pull, NULL);
-    T(d && !s->open(2, 44100, count_pull, NULL));   /* 48 kHz only, as hle_audio.c */
+    audio_dev *d = s->open(2, 48000, count_pull, NULL, NULL);
+    T(d && !s->open(2, 44100, count_pull, NULL, NULL));   /* 48 kHz only, as hle_audio.c */
     uint64_t t0 = now_ns();
     T(s->start(d) == 0);
     Sleep(1000);

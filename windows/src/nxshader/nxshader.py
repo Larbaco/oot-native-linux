@@ -12,7 +12,7 @@
   nxshader.py validate [--cache DIR]                          spirv-val on every module the cache publishes
   nxshader.py lookup K [--cache DIR]                          what the runtime's lookup gives
   nxshader.py gc [--cache DIR]                                drop inner cache entries no published shader refers to
-Defaults: --cache <repo>/_local/nxshader/cache, the translator in <installer>/host/windows/dmsh_xlate_bin, the Vulkan SDK's tools under %VULKAN_SDK%."""
+Defaults: --cache <repo>/_local/nxshader/cache, the translator where find_translator() looks (below), the Vulkan SDK's tools under %VULKAN_SDK%."""
 import argparse, collections, concurrent.futures as cf, ctypes, hashlib, json, os, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -24,6 +24,25 @@ WORK = os.path.normpath(os.path.join(REPO, '..'))
 DEFAULT_CACHE = os.path.join(REPO, '_local', 'nxshader', 'cache')
 # the installer: this tree's parent inside pokopia-native (windows/ beside nxs2.py), else the sibling folder of the private layout
 DEFAULT_INSTALLER = WORK if os.path.exists(os.path.join(WORK, 'nxs2.py')) else os.path.join(WORK, 'installer')
+def translator_candidates(installer):
+    """Where the built dmsh_xlate (dmsh_xlate.dll + its siblings) can be, best first. The tree ships no prebuilt copy: `nxs2.py setup` builds it from
+    host/nxnative-switch2.patch and publishes it to $NXS2_BIN (default <installer>/bin) and to nxnative's dm/gfx/tools/dmsh_xlate_bin; the last entry is
+    the layout of a packaged runtime (<runtime>/installer/host/windows/dmsh_xlate_bin)."""
+    nx = os.environ.get('NXNATIVE') or os.path.join(installer, 'nxnative')
+    return [d for d in (os.environ.get('NXS2_BIN'), os.path.join(installer, 'bin'), os.path.join(nx, 'dm', 'gfx', 'tools', 'dmsh_xlate_bin'),
+                        os.path.join(installer, 'host', 'windows', 'dmsh_xlate_bin')) if d]
+
+
+def find_translator(installer):
+    """The folder of the built translator; exits with the instructions to build it when there is none"""
+    cands = translator_candidates(installer)
+    for d in cands:
+        if os.path.exists(os.path.join(d, 'dmsh_xlate.dll')): return d
+    sys.exit('nxshader: no built shader translator (dmsh_xlate.dll). It is not part of the source tree: build it from host/nxnative-switch2.patch with\n'
+             '    python3 nxs2.py setup        (needs the .NET 10 SDK)\n'
+             'or point at an existing build with --xlate <folder> (or NXS2_BIN=<folder>). Looked in:\n' + ''.join('    ' + d + '\n' for d in cands))
+
+
 FRONT_VERSION = 2   # nxs_front.py's job building and the integer-input rule (2: uses inside functions only)
 BELOW_NORMAL = 0x00004000
 
@@ -318,7 +337,7 @@ def main():
     ap.add_argument('--cache', default=os.environ.get('NXSHADER_CACHE', DEFAULT_CACHE))
     ap.add_argument('--installer', default=DEFAULT_INSTALLER)
     ap.add_argument('--game', default='0400486024DEC000', help='the game profile: <installer>/games/<id> (default: Ocarina of Time)')
-    ap.add_argument('--xlate', default=None, help='the translator folder (default <installer>/host/windows/dmsh_xlate_bin)')
+    ap.add_argument('--xlate', default=None, help='the folder of the built translator, dmsh_xlate.dll and siblings (default: find_translator(): $NXS2_BIN, <installer>/bin, nxnative\'s dmsh_xlate_bin)')
     sp = ap.add_subparsers(dest='cmd', required=True)
     b = sp.add_parser('build'); b.add_argument('build'); b.add_argument('--profile'); b.add_argument('--keys', nargs='*'); b.add_argument('--jobs', type=int, default=1)
     b.add_argument('--report'); b.add_argument('--variants'); b.add_argument('--no-validate', action='store_true'); b.add_argument('--resume', action='store_true')
@@ -329,7 +348,8 @@ def main():
     lk = sp.add_parser('lookup'); lk.add_argument('key')
     sp.add_parser('gc')
     a = ap.parse_args()
-    if not a.xlate: a.xlate = os.path.join(a.installer, 'host', 'windows', 'dmsh_xlate_bin')
+    if not a.xlate: a.xlate = find_translator(a.installer)
+    elif not os.path.exists(os.path.join(a.xlate, 'dmsh_xlate.dll')): sys.exit(f'nxshader: --xlate {a.xlate} has no dmsh_xlate.dll (build it with `python3 nxs2.py setup`)')
     return {'build': cmd_build, 'ondemand': cmd_ondemand, 'variant': cmd_variant, 'validate': cmd_validate, 'lookup': cmd_lookup, 'gc': cmd_gc}[a.cmd](a)
 
 

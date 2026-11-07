@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -302,6 +303,8 @@ class RenderDocsTests(unittest.TestCase):
     def test_unconfirmed_platform_claims_fail(self):
         self.assertTrue(self.check({'TESTER-v1.2.3.md': 'send your ' + 'Steam' + 'OS version'}))
         self.assertEqual([], self.check({'TESTER-v1.2.3.md': 'send your Linux distribution and version'}))
+        # legitimate mentions elsewhere are not blocked
+        self.assertEqual([], self.check({'README.md': 'compatibility notes mention Steam' + 'OS', 'docs/notes.md': 'Steam' + 'OS research'}))
 
     def test_package_files_do_not_carry_the_release_readme_template(self):
         self.assertNotIn('release/README-RELEASE.md', (REL / 'package-files.txt').read_text().split())
@@ -310,18 +313,22 @@ class RenderDocsTests(unittest.TestCase):
         self.assertEqual([], self.check({'LICENSES/x.txt': 'oot-native-linux-x86_64-v0.0.1-x', 'python/doc.md': 'oot-native-linux-x86_64-v0.0.1-x'}))
 
     def test_the_repository_documentation_renders_and_checks_clean(self):
+        # the version under test is the one whose tester guide the allowlist names, so this keeps working release after release
+        guides = re.findall(r'^TESTER-v(\d+\.\d+\.\d+)\.md$', (REL / 'allowlist.txt').read_text(), re.M)
+        self.assertEqual(1, len(guides), guides)
+        ver = guides[0]
         tmp = pathlib.Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp)
-        for name in ('README.md', 'release/README-RELEASE.md', 'release/THIRD-PARTY-SOURCE.md', 'TESTER-v0.1.4.md', 'release/allowlist.txt'):
+        for name in ('README.md', 'release/README-RELEASE.md', 'release/THIRD-PARTY-SOURCE.md', f'TESTER-v{ver}.md', 'release/allowlist.txt'):
             (tmp / name).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(ROOT / name, tmp / name)
-        pkg = 'oot-native-linux-x86_64-v0.1.4-2026-11-07'
-        rd.render_tree(tmp, '0.1.4', pkg)
-        self.assertEqual([], rd.check_tree(tmp, '0.1.4', pkg, ('release/README-RELEASE.md',)))
-        self.assertTrue(rd.check_tree(tmp, '0.1.4', pkg))      # the template alone keeps its baseline placeholders, nowhere else
-        self.assertEqual([], rd.check_tester_guide(tmp, '0.1.4'))
-        self.assertTrue(rd.check_tester_guide(tmp, '0.1.5'))      # no guide for another version
-        self.assertTrue(rd.check_tree(tmp, '0.1.5', 'oot-native-linux-x86_64-v0.1.5-2026-11-08'))
+        pkg = f'oot-native-linux-x86_64-v{ver}-2026-11-07'
+        rd.render_tree(tmp, ver, pkg)
+        self.assertEqual([], rd.check_tree(tmp, ver, pkg, ('release/README-RELEASE.md',)))
+        self.assertTrue(rd.check_tree(tmp, ver, pkg))      # the template alone keeps its baseline placeholders, nowhere else
+        self.assertEqual([], rd.check_tester_guide(tmp, ver))
+        self.assertTrue(rd.check_tester_guide(tmp, '9.9.9'))      # no guide for another version
+        self.assertTrue(rd.check_tree(tmp, '9.9.9', 'oot-native-linux-x86_64-v9.9.9-2026-11-08'))
 
 
 @unittest.skipUnless(shutil.which('gh') and shutil.which('git'), 'needs gh and git')

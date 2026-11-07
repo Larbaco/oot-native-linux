@@ -16,8 +16,10 @@ import re
 import sys
 
 DOC_FILES = ('README.md', 'README-RELEASE.md', 'THIRD-PARTY-SOURCE.md', 'release/README-RELEASE.md', 'release/THIRD-PARTY-SOURCE.md')
-# Text that must not appear in packaged or published documentation: claims nobody confirmed (the owner has not confirmed that testers use it).
+# Unconfirmed claims about the testers' platform. Applied ONLY to the tester guides (TESTER-v*.md): elsewhere the term is a legitimate
+# mention (compatibility notes, research) and must not be blocked.
 FORBIDDEN_TERMS = ('SteamOS',)
+TERM_FILES = re.compile(r'(?:^|/)TESTER-v[\w.\-]+\.md$')
 # Placeholders that are filled after rendering (from the measured package) may remain only in these templates, and only in the source tree.
 LATER = {'GLIBC_BASELINE', 'GLIBCXX_BASELINE'}
 TOKEN = re.compile(r'@([A-Z][A-Z0-9_]*)@')
@@ -94,7 +96,7 @@ def check_tree(root: pathlib.Path, version: str, pkg_name: str, allow_templates:
             if m.group(1) in LATER and rel in allow_templates:
                 continue
             problems.append(f'{rel}: unfilled placeholder {m.group(0)}')
-        for term in FORBIDDEN_TERMS:
+        for term in (FORBIDDEN_TERMS if TERM_FILES.search(rel) else ()):
             if term.lower() in text.lower():
                 problems.append(f'{rel}: mentions {term}, which is not a confirmed platform for testers')
         for m in ARCHIVE_NAME.finditer(text):

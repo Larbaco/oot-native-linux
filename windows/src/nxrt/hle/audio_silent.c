@@ -35,7 +35,8 @@ static void *sink_main(void *p) {
     }
     return NULL;
 }
-static audio_dev *s_open(int ch, int rate, audio_pull_fn pull, void *ctx) {
+static audio_dev *s_open(int ch, int rate, audio_pull_fn pull, audio_ready_fn ready, void *ctx) {
+    (void)ready;   // no sound, so nothing to hold in reserve
     if (ch < 1 || ch > 8 || rate != RATE) return NULL;
     audio_dev *d = calloc(1, sizeof *d);
     if (!d) return NULL;

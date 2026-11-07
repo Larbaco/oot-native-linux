@@ -10,8 +10,8 @@ import nxs_front as F, nxshader as N
 
 def main():
     build = os.environ.get('NXSHADER_BUILD') or os.path.join(N.WORK, 'installer-test-win', 'build201')
-    xl = os.path.join(N.DEFAULT_INSTALLER, 'host', 'windows', 'dmsh_xlate_bin')
-    if not os.path.isdir(os.path.join(build, 'shader', 'pkg')) or not os.path.exists(os.path.join(xl, 'dmsh_xlate.dll')) or not N.vk_tool('spirv-val'):
+    xl = next((d for d in N.translator_candidates(N.DEFAULT_INSTALLER) if os.path.exists(os.path.join(d, 'dmsh_xlate.dll'))), '')
+    if not os.path.isdir(os.path.join(build, 'shader', 'pkg')) or not xl or not N.vk_tool('spirv-val'):
         print(f'no build folder with a shader package at {build} (or no translator / Vulkan SDK): skipped'); return 77
     c = F.Corpus(build)
     by = {}

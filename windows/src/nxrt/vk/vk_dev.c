@@ -184,11 +184,16 @@ int vk_dev_open(const vk_dev_opts *o, const char *const *inst_exts, uint32_t n_i
     else if (!f2.features.textureCompressionBC) miss = "textureCompressionBC";
     else if (!f13.maintenance4) miss = "maintenance4";
     if (miss) { VKRED("%s lacks %s, which the renderer needs", g_vk.props.deviceName, miss); return -1; }
-    // Enabled: every supported feature except robustness that costs performance (robustBufferAccess stays on NVIDIA, as Ryujinx does) and capture/replay addresses
+    // Enabled: every supported feature except robustness that costs performance (robustBufferAccess stays on NVIDIA, as Ryujinx does) and capture/replay addresses.
+    // Diagnostic (off by default): NXRT_VK_ROBUST=1 turns buffer and image robustness on, so a shader's read past a buffer or image is a defined zero instead of a stray
+    // read (A/B for flashes and white spots); NXRT_VK_ROBUST=0 forces it off. From the upstream project 77d1060 (MIT; see windows/docs/PROVENANCE.md), minus its CPU-driver default.
+    const char *rob = getenv("NXRT_VK_ROBUST");
+    const int robust = rob && atoi(rob) != 0;
     VkPhysicalDeviceFeatures en = f2.features;
-    en.robustBufferAccess = g_vk.props.vendorID == 0x10de && f2.features.robustBufferAccess;
+    en.robustBufferAccess = (robust || (!rob && g_vk.props.vendorID == 0x10de)) && f2.features.robustBufferAccess;
     en.inheritedQueries = 0;
-    f13.robustImageAccess = 0; f12.bufferDeviceAddressCaptureReplay = 0; f12.bufferDeviceAddressMultiDevice = 0; f11.protectedMemory = 0;
+    f13.robustImageAccess = robust && f13.robustImageAccess; f12.bufferDeviceAddressCaptureReplay = 0; f12.bufferDeviceAddressMultiDevice = 0; f11.protectedMemory = 0;
+    if (robust) VKLOG("robust buffer access %s, robust image access %s (NXRT_VK_ROBUST)", en.robustBufferAccess ? "on" : "unsupported", f13.robustImageAccess ? "on" : "unsupported");
     for (int i = 0; i < NEF; i++) {
         if (!fs[i]) continue;
         if (ef[i].st == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT) {

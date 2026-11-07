@@ -8,6 +8,9 @@
 #ifdef _WIN32
 #include <process.h>
 #endif
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -244,6 +247,9 @@ static unsigned completion_main(void *arg) {
 }
 
 int vks_init(void) {
+#ifdef __linux__
+    { const char *pt = getenv("NXRT_PTRACE_ANY"); if (pt && atoi(pt)) prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0); }   // diagnostics: lets gdb -p attach under yama ptrace_scope=1 (sampling profiles)
+#endif
     const char *e = getenv("NXRT_VK_BATCH"); if (e && atoi(e) > 0) g_batch = atoi(e) < NSLOT / 2 ? atoi(e) : NSLOT / 2;
     if ((e = getenv("NXRT_GPU_WATCHDOG_MS"))) g_wd_ms = (unsigned)atoi(e);
     for (int i = 0; i < NSLOT; i++) slot_init(&g_slot[i]);

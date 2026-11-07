@@ -1,4 +1,4 @@
-# OoT Native Linux x86-64 — v0.1.4 (WIP)
+# OoT Native Linux x86-64 — v0.1.5 (WIP)
 
 ## English
 
@@ -19,11 +19,12 @@ and takes effect on the next start. For the CLI, use
 `--lang en` or `--lang pt-BR`, or set `OOT_NATIVE_LANG=en|pt-BR`. The system
 locale does not change the default language.
 
-Version 0.1.4 bundles FFmpeg 7.1.1 with dav1d 1.5.1 for AV1 movie decoding.
+Version 0.1.5 bundles FFmpeg 7.1.1 with dav1d 1.5.1 for AV1 movie decoding.
 Decoding is enabled by default; set `NXRT_MOVIE_DECODE=0` to use the timed
 no-image fallback. The exact source tarballs are in the adjacent
-`oot-native-linux-x86_64-v0.1.4-2026-11-07-thirdparty-source.tar.xz` archive.
-See `TESTER-v0.1.4.md` to test with an existing build without rebuilding it.
+`oot-native-linux-x86_64-v0.1.5-2026-11-07-thirdparty-source.tar.xz` archive.
+See `TESTER-v0.1.5.md` for whether this version can reuse an existing build and
+how to test it.
 
 ```sh
 ./oot-native-launcher --check "/path/to/your-dump.nup"
@@ -99,11 +100,12 @@ e passa a valer na próxima inicialização. Na CLI, use
 `--lang en` ou `--lang pt-BR`, ou defina `OOT_NATIVE_LANG=en|pt-BR`. O locale
 do sistema não altera o idioma padrão.
 
-O v0.1.4 inclui FFmpeg 7.1.1 com dav1d 1.5.1 para decodificar vídeos AV1. A
+O v0.1.5 inclui FFmpeg 7.1.1 com dav1d 1.5.1 para decodificar vídeos AV1. A
 decodificação fica ativa por padrão; defina `NXRT_MOVIE_DECODE=0` para usar o
 fallback temporizado sem imagem. Os tarballs exatos do código-fonte estão no
-arquivo adjacente `oot-native-linux-x86_64-v0.1.4-2026-11-07-thirdparty-source.tar.xz`.
-Consulte `TESTER-v0.1.4.md` para testar com um build existente, sem recompilá-lo.
+arquivo adjacente `oot-native-linux-x86_64-v0.1.5-2026-11-07-thirdparty-source.tar.xz`.
+Consulte `TESTER-v0.1.5.md` para saber se esta versão pode reutilizar um build
+existente e como testá-la.
 
 ```sh
 ./oot-native-launcher --check "/caminho/do/seu-dump.nup"

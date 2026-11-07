@@ -31,4 +31,6 @@ program.db
 shots/
 bin/
 setup-*.log
+# debug symbols embed the builder's Windows paths (e4848c4 upstream, release hygiene)
+*.pdb
 release/local.mk

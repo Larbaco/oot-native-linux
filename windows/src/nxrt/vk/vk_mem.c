@@ -8,6 +8,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __linux__
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#endif
 
 void dm_guest_write_prepare(void *addr, size_t len);   // host/crash.c: unprotect before the host writes guest memory
 
@@ -28,6 +34,7 @@ typedef struct {
     uint8_t *committed;           // per page: seen committed and readable once (pool_sync asks VirtualQuery only for pages not known yet)
     _Atomic uint8_t *gpu_pending;   // per page: GPU writes recorded whose bytes have not reached guest memory yet (the device copy is the newer one)
     uint64_t hot_n, cursor;       // vkm_sync_all's position
+    uint64_t clean_epoch, pass_ep; int pass_left;   // sync_all_within: the tracker's write count at which a whole pass found nothing left to copy (0 = unknown); the count at the start of the pass in progress, and whether it stepped over pages it could not copy
     uint64_t *unc_until;          // per page: the frame until which a page found uncommitted (and zero-filled) is not asked about again
     uint64_t *hot_sub;            // hot pages: the submission whose upload command buffer last copied the page (all uploads of a submission run before its main commands, so a second copy in it changes nothing the GPU can see)
     uint8_t *owned; uint8_t **shadow;   // GPU-owned pages (written through global memory pointers): guest memory as the mirror last had it, so a CPU write is applied as the words that differ, not as the whole page
@@ -39,6 +46,7 @@ typedef struct {
 // Unbound granules of a sparse pool all map to one zeroed granule (SPARSE_ALIASED): AMD hangs on a read of a sparse page nothing is bound to, and shaders that go through the global memory page
 // table can read anywhere in a pool (Eglantine 8e82c282de / eff0fe3bbf / 4506f0c7a0). NXRT_VK_SPARSE_ALIAS=1 enables it; DEFAULT OFF: vkQueueBindSparse(alias) fails (-4) then device lost on a windowed/swapchain run, the stall's real fix was the upload storm
 static struct { VkBuffer buf; vk_alloc mem; int ok, tried; } g_zero;
+static __thread int t_left;   // pool_sync stepped over pages that still need a copy (uncommitted, or a GPU write in flight): the pool is not known clean
 static __thread int t_why;   // 0 use, 1 gmem touch, 2 sync_all / commit sync (diagnostics: who the upload bytes are for)
 static _Atomic uint64_t s_t_query, s_t_copy, s_t_prot, s_t_bind, s_t_scan, s_unc_skipped;   // ns inside pool_sync (diagnostics)
 static _Atomic uint64_t g_shadow_pages, s_own_pages, s_own_words, s_own_full;
@@ -52,13 +60,16 @@ static VkBufferUsageFlags g_usage;
 static VkDeviceSize g_gran = GRAN, g_max_buffer;
 static int g_alias;   // overlapping windows: sparse binding with aliasing (NXRT_VK_NO_ALIAS=1 turns them off, for tests)
 
+// ST_Q: allocation records the ring keeps (one per upload run and overflow buffer). At 4096 a frame of ~1200 small runs, three frames in flight, filled it and every further run waited for the GPU to finish a submission
+enum { ST_Q = 16384 };
 static struct {
     VkBuffer buf; vk_alloc mem; uint8_t *map; VkDeviceSize size, head, tail; int wrapped;
-    struct { uint64_t value; int owner; VkDeviceSize begin, end; VkBuffer ovf; vk_alloc ovf_mem; } q[4096]; unsigned qh, qt;   // allocations in order; value 0 until owner commits
+    struct { uint64_t value; int owner; VkDeviceSize begin, end; VkBuffer ovf; vk_alloc ovf_mem; } q[ST_Q]; unsigned qh, qt;   // allocations in order; value 0 until owner commits
     plat_rwlock_t lk;
 } g_st;
 
 static uint64_t g_budget = 64ull << 20, g_budget_used;
+static _Atomic uint64_t s_t_stwait, s_t_stovf;   // ns waiting in vkm_staging for the GPU (ring full), ns making overflow buffers (diagnostics)
 static _Atomic uint64_t s_up_bytes, s_up_pages, s_up_runs, s_up_ns, s_sync, s_st_bytes, s_st_ovf, s_st_waits, s_wb_bytes, s_uncommitted, s_recopy_pages;
 
 // ---------- Staging ring ----------
@@ -66,7 +77,7 @@ static VkDeviceSize g_ovf_live;   // bytes in overflow staging buffers not freed
 static void st_reclaim(void) {   // caller holds g_st.lk
     uint64_t done = atomic_load(&g_vk.tl_done);
     while (g_st.qt != g_st.qh) {
-        unsigned i = g_st.qt % 4096;
+        unsigned i = g_st.qt % ST_Q;
         if (!g_st.q[i].value || g_st.q[i].value > done) break;
         if (g_st.q[i].ovf) { vkDestroyBuffer(g_vk.dev, g_st.q[i].ovf, NULL); vk_free_mem(&g_st.q[i].ovf_mem); g_st.q[i].ovf = VK_NULL_HANDLE; g_ovf_live -= g_st.q[i].end; }
         else g_st.tail = g_st.q[i].end;
@@ -77,7 +88,7 @@ static void st_reclaim(void) {   // caller holds g_st.lk
 // Called by vk_submit at each commit: that slot's allocations now live until its timeline value
 void vkm_committed(int owner, uint64_t value) {
     plat_rw_wrlock(&g_st.lk);
-    for (unsigned k = g_st.qt; k != g_st.qh; k++) if (!g_st.q[k % 4096].value && g_st.q[k % 4096].owner == owner) g_st.q[k % 4096].value = value;
+    for (unsigned k = g_st.qt; k != g_st.qh; k++) if (!g_st.q[k % ST_Q].value && g_st.q[k % ST_Q].owner == owner) g_st.q[k % ST_Q].value = value;
     plat_rw_wrunlock(&g_st.lk);
 }
 int vks_owner(void);
@@ -89,7 +100,7 @@ void *vkm_staging(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDeviceSiz
     plat_rw_wrlock(&g_st.lk);
     for (int attempt = 0; attempt < 64; attempt++) {
         st_reclaim();
-        if (g_st.qh - g_st.qt >= 4095) goto wait;
+        if (g_st.qh - g_st.qt >= ST_Q - 1) goto wait;
         VkDeviceSize a = (g_st.head + align - 1) / align * align;
         int ok = 0;
         if (!g_st.wrapped) {   // free space: [head, size) then [0, tail)
@@ -97,7 +108,7 @@ void *vkm_staging(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDeviceSiz
             else if (n <= g_st.tail) { a = 0; g_st.wrapped = 1; ok = 1; }
         } else if (a + n <= g_st.tail) ok = 1;
         if (ok) {
-            unsigned i = g_st.qh++ % 4096;
+            unsigned i = g_st.qh++ % ST_Q;
             g_st.q[i].value = 0; g_st.q[i].owner = owner; g_st.q[i].begin = a; g_st.q[i].end = a + n; g_st.q[i].ovf = VK_NULL_HANDLE;
             g_st.head = a + n;
             plat_rw_wrunlock(&g_st.lk);
@@ -107,21 +118,22 @@ void *vkm_staging(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDeviceSiz
         if (n > g_st.size / 2) break;   // too big for the ring: a buffer of its own
     wait:;
         // the ring is full: wait for the oldest committed allocation's submission; when only the recording's own remain, overflow
-        uint64_t v = g_st.qt != g_st.qh ? g_st.q[g_st.qt % 4096].value : 0;
+        uint64_t v = g_st.qt != g_st.qh ? g_st.q[g_st.qt % ST_Q].value : 0;
         if (!v) break;
         plat_rw_wrunlock(&g_st.lk);
         atomic_fetch_add(&s_st_waits, 1);
-        vks_wait(v, UINT64_MAX);
+        { uint64_t tw = now_ns(); vks_wait(v, UINT64_MAX); atomic_fetch_add(&s_t_stwait, now_ns() - tw); }
         plat_rw_wrlock(&g_st.lk);
     }
     // Overflow: a host buffer for this submission alone, released with it. Bounded: past NXRT_VK_OVERFLOW_MB (default 768) of them in flight, wait for the oldest committed one first
     // (2026-11-05: 11 GB of them at once filled the GTT and the submission failed with "Not enough memory")
     { static VkDeviceSize cap; if (!cap) { const char *e = getenv("NXRT_VK_OVERFLOW_MB"); cap = (e && atoi(e) > 0 ? (VkDeviceSize)atoi(e) : 768) << 20; }
       for (int w = 0; w < 64 && g_ovf_live + n > cap; w++) {
-        uint64_t v = 0; for (unsigned k = g_st.qt; k != g_st.qh; k++) if (g_st.q[k % 4096].ovf && g_st.q[k % 4096].value) { v = g_st.q[k % 4096].value; break; }
+        uint64_t v = 0; for (unsigned k = g_st.qt; k != g_st.qh; k++) if (g_st.q[k % ST_Q].ovf && g_st.q[k % ST_Q].value) { v = g_st.q[k % ST_Q].value; break; }
         if (!v) break;
-        plat_rw_wrunlock(&g_st.lk); atomic_fetch_add(&s_st_waits, 1); vks_wait(v, UINT64_MAX); plat_rw_wrlock(&g_st.lk); st_reclaim();
+        plat_rw_wrunlock(&g_st.lk); atomic_fetch_add(&s_st_waits, 1); { uint64_t tw = now_ns(); vks_wait(v, UINT64_MAX); atomic_fetch_add(&s_t_stwait, now_ns() - tw); } plat_rw_wrlock(&g_st.lk); st_reclaim();
       } }
+    uint64_t t_ovf = now_ns();
     VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, n, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
     VkBuffer b = VK_NULL_HANDLE; vk_alloc m;
     void *p = NULL;
@@ -129,13 +141,13 @@ void *vkm_staging(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDeviceSiz
         VkMemoryRequirements mr; vkGetBufferMemoryRequirements(g_vk.dev, b, &mr);
         if (!vk_alloc_mem(&mr, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &m)) {
             vkBindBufferMemory(g_vk.dev, b, m.mem, m.off); p = m.map;
-            unsigned i = g_st.qh++ % 4096;
+            unsigned i = g_st.qh++ % ST_Q;
             g_st.q[i].value = 0; g_st.q[i].owner = owner; g_st.q[i].begin = 0; g_st.q[i].end = n; g_st.q[i].ovf = b; g_st.q[i].ovf_mem = m; g_ovf_live += n;
         } else { vkDestroyBuffer(g_vk.dev, b, NULL); b = VK_NULL_HANDLE; }
     }
     plat_rw_wrunlock(&g_st.lk);
     if (!p) { VKRED("staging: no host memory for %llu bytes", (unsigned long long)n); return NULL; }
-    atomic_fetch_add(&s_st_ovf, 1); atomic_fetch_add(&s_st_bytes, n);
+    atomic_fetch_add(&s_st_ovf, 1); atomic_fetch_add(&s_st_bytes, n); atomic_fetch_add(&s_t_stovf, now_ns() - t_ovf);
     *buf = b; *off = 0; return p;
 }
 uint64_t vkm_budget_left(void) { return g_budget_used >= g_budget ? 0 : g_budget - g_budget_used; }
@@ -375,8 +387,41 @@ static void maps_refresh(void) {
     }
     fclose(f); g_mp.n = n; g_mp.t = now_ns();
 }
+// Linux 6.11+: PROCMAP_QUERY asks the kernel for one VMA by address (binary search), where the list above is the whole of /proc/self/maps parsed (50 ms a refresh once the dirty tracker's protections have
+// split the pools into tens of thousands of VMAs; 4 refreshes a second were 4 % of the scene). NXRT_VK_PROCMAP=0 keeps the list. Fresh answers instead of up to 250 ms old ones
+struct procmap_query_ { uint64_t size, query_flags, query_addr, vma_start, vma_end, vma_flags, vma_page_size, vma_offset, inode; uint32_t dev_major, dev_minor, vma_name_size, build_id_size; uint64_t vma_name_addr, build_id_addr; };
+#define PROCMAP_QUERY_ _IOWR('f', 17, struct procmap_query_)
+static int procmap_q(uint64_t a, uint64_t flags, uint64_t *start, uint64_t *end, uint64_t *vflags) {   // 0 = a VMA (covering a, or the next one: flag 0x10), 1 = none, -1 = not supported
+    static int fd = -2; static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER; static int on = -1;
+    if (on < 0) { const char *e = getenv("NXRT_VK_PROCMAP"); on = !(e && *e && !atoi(e)); }
+    if (!on) return -1;
+    pthread_mutex_lock(&lk);
+    if (fd == -2) fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    int r = -1;
+    if (fd >= 0) {
+        struct procmap_query_ q; memset(&q, 0, sizeof q); q.size = sizeof q; q.query_addr = a; q.query_flags = flags | 0x10;
+        if (!ioctl(fd, PROCMAP_QUERY_, &q)) { *start = q.vma_start; *end = q.vma_end; *vflags = q.vma_flags; r = 0; }
+        else if (errno == ENOENT) r = 1;
+        else { close(fd); fd = -1; on = 0; }   // ENOTTY / EINVAL: an older kernel: the list
+    }
+    pthread_mutex_unlock(&lk);
+    return r;
+}
 static int vkm_mem_query(const void *addr, uint64_t *end, size_t look) {
     uint64_t a = (uint64_t)(uintptr_t)addr & ~(uint64_t)(PAGE - 1), stop = a + (look ? look : PAGE);
+    { uint64_t vs, ve, vf; int r = procmap_q(a, 0, &vs, &ve, &vf);
+      if (r >= 0) {
+        if (r == 0 && vs <= a && (vf & 1)) {   // readable: through the readable VMAs that follow without a gap
+            uint64_t e = ve; int n = 0;
+            while (e < stop && n++ < 4096) { uint64_t s2, e2, f2; if (procmap_q(e, 0, &s2, &e2, &f2) || s2 != e || !(f2 & 1)) break; e = e2; }
+            if (end) *end = e < stop ? e : stop;
+            return 1;
+        }
+        uint64_t s2, e2, f2;   // not readable: the gap lasts until the next readable VMA
+        uint64_t e = procmap_q(a, 1, &s2, &e2, &f2) == 0 ? s2 : stop;
+        if (end) *end = e < stop ? e : stop;
+        return 0;
+      } }
     if (!g_mp.init) { g_mp.init = 1; pthread_mutex_init(&g_mp.lk, NULL); }
     pthread_mutex_lock(&g_mp.lk);
     if (!g_mp.n || now_ns() - g_mp.t > 250000000ull) maps_refresh();
@@ -485,7 +530,7 @@ static uint64_t pool_sync(pool_t_ *p, uint64_t p0, uint64_t p1, VkCommandBuffer 
     uint64_t queued = 0, t0 = now_ns(), pg = p0;
     while (pg < p1 && queued < budget) {
         if (!(pg & 63) && pg + 64 <= p1 && group_clean(p, pg)) { pg += 64; continue; }
-        if (!PAGE_NEEDS(p, pg)) { pg++; continue; }
+        if (!PAGE_NEEDS(p, pg)) { if (atomic_load(&p->gpu_pending[pg])) t_left = 1; pg++; continue; }
         uint64_t run0 = pg;
         while (pg < p1 && pg - run0 < RUN_MAX && PAGE_NEEDS(p, pg)) { if (p->up[pg] && !p->hot[pg]) page_rewritten(p, pg); pg++; }
         // Pages the game never touched are not committed (the heap commits lazily): nothing to read or protect there. A use reads them as zeros and
@@ -497,7 +542,7 @@ static uint64_t pool_sync(pool_t_ *p, uint64_t p0, uint64_t p1, VkCommandBuffer 
         else {
             if (p->unc_until && p->unc_until[run0] > g_frame) {   // found uncommitted a moment ago and zero-filled: not asked again yet
                 uint64_t e = run0; while (e < pg && p->unc_until[e] > g_frame) e++;
-                pg = e; atomic_fetch_add(&s_unc_skipped, pg - run0); continue;
+                pg = e; atomic_fetch_add(&s_unc_skipped, pg - run0); t_left = 1; continue;
             }
             uint64_t region_end = 0, tq = now_ns();
             int readable = vkm_mem_query((const void *)(p->base + run0 * PAGE), &region_end, (size_t)((p1 - run0) * PAGE));
@@ -509,7 +554,7 @@ static uint64_t pool_sync(pool_t_ *p, uint64_t p0, uint64_t p1, VkCommandBuffer 
                     if (!p->unc_until) p->unc_until = calloc(p->npages, sizeof *p->unc_until);
                     if (p->unc_until) for (uint64_t k = run0; k < pg; k++) p->unc_until[k] = g_frame + 8; }
                 else if (rend > pg) pg = rend < p1 ? rend : p1;
-                p->uncommitted_fill += (pg - run0) * PAGE;
+                p->uncommitted_fill += (pg - run0) * PAGE; t_left = 1;
                 atomic_fetch_add(&s_uncommitted, pg - run0);
                 continue;
             }
@@ -527,7 +572,7 @@ static uint64_t pool_sync(pool_t_ *p, uint64_t p0, uint64_t p1, VkCommandBuffer 
         atomic_fetch_add(&s_t_prot, now_ns() - tp);
         VkBuffer sb; VkDeviceSize so;
         uint64_t tg = now_ns(); uint8_t *dst = vkm_staging(n, 16, &sb, &so); atomic_fetch_add(&s_t_bind, now_ns() - tg);
-        if (!dst) { pg = run0; break; }
+        if (!dst) { pg = run0; t_left = 1; break; }
         { uint64_t tc = now_ns(); guest_copy(dst, (const void *)(p->base + off), (size_t)n); atomic_fetch_add(&s_t_copy, now_ns() - tc); }
         { uint64_t first = 0, hot = 0; for (uint64_t k = run0; k < pg; k++) { first += !p->up[k]; hot += p->hot[k]; }
           p->upb_first += first * PAGE; p->upb_hot += hot * PAGE; if (t_why == 1) p->upb_touch += n; else if (t_why == 2) p->upb_all += n; else p->upb_use += n; }
@@ -578,8 +623,8 @@ void vkm_gmem_own(uint64_t ptr) {
             if (p->up[k] && p->span && !page_needs(p, k)) {   // the mirror matches guest memory: its content is the shadow
                 uint8_t *sh = malloc(PAGE);
                 if (!guest_copy(sh, (const void *)(p->base + k * PAGE), PAGE) && !nvn_dirty_since_span(p->span, (const void *)(p->base + k * PAGE), PAGE, p->up[k])) { p->shadow[k] = sh; atomic_fetch_add(&g_shadow_pages, 1); }
-                else { free(sh); p->up[k] = 0; }   // written meanwhile: copied afresh at the next use (the shadow comes from that copy)
-            } else p->up[k] = 0;   // not copied yet (or untracked): the first copy takes the shadow
+                else { free(sh); p->up[k] = 0; p->clean_epoch = 0; }   // written meanwhile: copied afresh at the next use (the shadow comes from that copy)
+            } else { p->up[k] = 0; p->clean_epoch = 0; }   // not copied yet (or untracked): the first copy takes the shadow
             p->owned[k] = 1; atomic_fetch_add(&s_own_pages, 1);
         }
     }
@@ -615,7 +660,7 @@ void vkm_recopy_once(uint64_t addr, uint64_t len) {
     if (full) return;
     plat_rw_rdlock(&g_lk);
     pool_t_ *p = pool_find((uintptr_t)addr, len);
-    if (p) for (uint64_t pg = (addr - p->base) / PAGE; pg <= (addr + len - 1 - p->base) / PAGE && pg < p->npages; pg++) if (p->up[pg]) { p->up[pg] = 0; atomic_fetch_add(&s_recopy_pages, 1); }
+    if (p) for (uint64_t pg = (addr - p->base) / PAGE; pg <= (addr + len - 1 - p->base) / PAGE && pg < p->npages; pg++) if (p->up[pg]) { p->up[pg] = 0; p->clean_epoch = 0; atomic_fetch_add(&s_recopy_pages, 1); }
     plat_rw_rdunlock(&g_lk);
 }
 
@@ -662,6 +707,17 @@ uint64_t vkm_gmem_commit_sync(void) {
     }
     return total;
 }
+// NXRT_VK_SYNC_SKIP (default 1; 0 off, 2 = check): sync_all_within (the background prefetch, and the sync after a submission that went through the global memory table) walked every page of every
+// pool (5 GB, 1.4 M pages) each time to find the few the CPU had written. A pool whose tracker range has had no page stamped since a pass that copied everything and stepped over nothing is skipped
+// (the tracker's write count, nvn_dirty_span_epoch). Pools with hot pages, uncommitted pages or a GPU write in flight are not. 2 also counts, in each skipped pool, the pages copied before that are
+// behind guest memory now (there must be none)
+static _Atomic uint64_t s_sync_skipped, s_sync_skip_bad;
+static int sync_skip_mode(void) { static int m = -1; if (m < 0) { const char *e = getenv("NXRT_VK_SYNC_SKIP"); m = e ? atoi(e) : 1; } return m; }
+static void sync_skip_check(pool_t_ *p) {
+    uint64_t bad = 0, first = 0;
+    for (uint64_t pg = 0; pg < p->npages; pg++) if (p->up[pg] && !p->hot[pg] && !(p->owned && p->owned[pg]) && !atomic_load(&p->gpu_pending[pg]) && nvn_dirty_since_span(p->span, (const void *)(p->base + pg * PAGE), PAGE, p->up[pg])) { if (!bad++) first = pg; }
+    if (bad && atomic_fetch_add(&s_sync_skip_bad, 1) < 20) VKLOG("[RED] sync skip: pool %p+%#llx was skipped as clean, but %llu pages copied before are behind guest memory (first page %llu)", (void *)p->lo, (unsigned long long)(p->hi - p->lo), (unsigned long long)bad, (unsigned long long)first);
+}
 static uint64_t sync_all_within(uint64_t g_scan_pages) {
     VkCommandBuffer cb = vks_upload_cb();
     if (!cb) return 0;
@@ -670,10 +726,19 @@ static uint64_t sync_all_within(uint64_t g_scan_pages) {
     for (int k = 0; k < g_npool && vkm_budget_left() && scanned < g_scan_pages; k++) {
         int i = (g_rr + k) % g_npool;
         pool_t_ *p = g_pool[i];
+        uint64_t ep = sync_skip_mode() && p->span ? nvn_dirty_span_epoch(p->span) : 0;
+        if (ep && ep == p->clean_epoch && !p->cursor && !p->hot_n) {   // nothing in the pool was written since a pass found it all copied: no scan
+            if (sync_skip_mode() == 2) sync_skip_check(p);
+            atomic_fetch_add(&s_sync_skipped, 1); g_rr = (i + 1) % g_npool; continue;
+        }
         uint64_t from = p->cursor < p->npages ? p->cursor : 0, to = from + (g_scan_pages - scanned), stop = from;
+        if (!from) { p->pass_ep = ep; p->pass_left = 0; }
+        t_left = 0;
         uint64_t n = pool_sync(p, from, to, cb, vkm_budget_left(), &stop);
+        p->pass_left |= t_left;
         vkm_budget_take(n); total += n; scanned += stop - from;
         p->cursor = stop >= p->npages ? 0 : stop;
+        if (stop >= p->npages && p->pass_ep && !p->pass_left && !p->hot_n) p->clean_epoch = p->pass_ep;
         if (p->cursor) { g_rr = i; break; }   // continue in this pool next time
         g_rr = (i + 1) % g_npool;
     }
@@ -709,15 +774,93 @@ static void nanfix(wb_t *w) {
     for (uint64_t k = 0; k < nw && k < 1040; k++) { if (f[k] != f[k]) { f[k] = last[slot][k]; fixed[slot]++; } else last[slot][k] = f[k]; }
     if (!(fixed[slot] & (fixed[slot] - 1)) && fixed[slot]) VKLOG("nanfix: %llu NaN words replaced so far in the write-backs at %#llx", (unsigned long long)fixed[slot], (unsigned long long)w->addr);
 }
+// NXRT_VK_WB_ADOPT (default 1): a write-back that lands on whole pages makes guest memory equal to the mirror there, so the pages need no copy back to the device. The write itself stamped them as
+// written by the CPU (dm_guest_write_prepare), and every use after a compute pass re-uploaded them (measured: 63 of the 70 MB/frame of upload in the forest were the pages the GPU had just written).
+// Per page fully inside the range, with no GPU write in flight, not hot, not GPU-owned and copied before: take the tracker's stamp, write-protect the page again, then compare it with the bytes that
+// landed (a CPU write before the protection shows up there, one after it faults and gets a newer generation); equal: the device copy is current as of that stamp
+static _Atomic uint64_t s_wb_adopted, s_wb_adopt_miss, s_wb_same;   // pages adopted, pages the CPU had changed, bytes of write-back that already matched guest memory (not written)
+static int wb_adopt_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("NXRT_VK_WB_ADOPT"); on = !(e && *e && !atoi(e)); } return on; }
+// NXRT_VK_WB_DIFF (default 1, with WB_ADOPT): the bytes of a write-back that guest memory already holds are not written: most of what a compute pass writes back each frame is what it wrote back the frame before, and writing it
+// meant un-protecting its pages (a system call and a new generation each) and copying them. Only the page-sized chunks that differ are written; the rest of the range is read, not written
+static void wb_apply(uint64_t addr, uint64_t len, const uint8_t *src) {
+    static int on = -1; if (on < 0) { const char *e = getenv("NXRT_VK_WB_DIFF"); on = !(e && *e && !atoi(e)); }
+    uint8_t *d = (uint8_t *)(uintptr_t)addr;
+    if (!on || !wb_adopt_on()) { dm_guest_write_prepare(d, (size_t)len); memcpy(d, src, (size_t)len); return; }
+    uint64_t o = 0, same = 0;
+    while (o < len) {
+        uint64_t pe = ((addr + o) | (PAGE - 1)) + 1 - addr; if (pe > len) pe = len;
+        if (!memcmp(d + o, src + o, (size_t)(pe - o))) { same += pe - o; o = pe; continue; }
+        uint64_t r0 = o; o = pe;
+        while (o < len) { pe = ((addr + o) | (PAGE - 1)) + 1 - addr; if (pe > len) pe = len; if (!memcmp(d + o, src + o, (size_t)(pe - o))) break; o = pe; }
+        dm_guest_write_prepare(d + r0, (size_t)(o - r0)); memcpy(d + r0, src + r0, (size_t)(o - r0));
+    }
+    atomic_fetch_add(&s_wb_same, same);
+}
+// NXRT_VK_WB_VERIFY=1 (diagnostics): a ring of the pages adopted; every 15 frames wb_verify reads some of them back from the device and compares them with guest memory (a page the CPU has not written
+// since, no GPU write in flight): a difference is a device copy that was taken for current and is not
+static struct { uint64_t addr[2048]; unsigned n; pthread_mutex_t lk; } g_av = {.lk = PTHREAD_MUTEX_INITIALIZER};
+static _Atomic uint64_t s_av_checked, s_av_bad;
+static int wb_verify_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("NXRT_VK_WB_VERIFY"); on = e && atoi(e); } return on; }
+static void wb_verify(void) {
+    if (!wb_verify_on()) return;
+    uint64_t pick[16]; int np = 0;
+    pthread_mutex_lock(&g_av.lk);
+    for (int i = 0; i < 16 && g_av.n; i++) { unsigned k = (unsigned)rand() % (g_av.n < 2048 ? g_av.n : 2048); pick[np++] = g_av.addr[k]; }
+    g_av.n = 0;
+    pthread_mutex_unlock(&g_av.lk);
+    for (int i = 0; i < np; i++) {
+        uint64_t a = pick[i]; uint8_t mir[PAGE];
+        plat_rw_rdlock(&g_lk); pool_t_ *p = pool_find((uintptr_t)a, PAGE); uint64_t pg = p ? (a - p->base) / PAGE : 0;
+        int ok = p && p->span && p->up[pg] && !p->hot[pg] && !(p->owned && p->owned[pg]) && !atomic_load(&p->gpu_pending[pg]) && !nvn_dirty_since_span(p->span, (const void *)a, PAGE, p->up[pg]);
+        plat_rw_rdunlock(&g_lk);
+        if (!ok || vkm_peek(a, mir, PAGE)) continue;
+        plat_rw_rdlock(&g_lk); p = pool_find((uintptr_t)a, PAGE);
+        ok = p && !atomic_load(&p->gpu_pending[pg]) && !nvn_dirty_since_span(p->span, (const void *)a, PAGE, p->up[pg]);
+        plat_rw_rdunlock(&g_lk);
+        if (!ok) continue;
+        atomic_fetch_add(&s_av_checked, 1);
+        if (memcmp(mir, (const void *)(uintptr_t)a, PAGE)) {
+            unsigned nd = 0, first = PAGE; for (unsigned k = 0; k < PAGE; k++) if (mir[k] != ((const uint8_t *)(uintptr_t)a)[k]) { nd++; if (first == PAGE) first = k; }
+            if (atomic_fetch_add(&s_av_bad, 1) < 20) VKLOG("[RED] wb verify: adopted page %#llx: the device copy differs from guest memory in %u bytes (first at +%u: device %02x guest %02x)", (unsigned long long)a, nd, first, mir[first], ((const uint8_t *)(uintptr_t)a)[first]);
+        }
+    }
+}
+static void wb_adopt(uint64_t addr, uint64_t len, const uint8_t *data) {
+    if (!wb_adopt_on() || !data) return;
+    plat_rw_rdlock(&g_lk);
+    pool_t_ *p = pool_find((uintptr_t)addr, len);
+    if (p && p->span && addr >= p->base) {
+        uint64_t pg0 = (addr - p->base + PAGE - 1) / PAGE, pg1 = (addr + len - p->base) / PAGE;
+        if (pg1 > p->npages) pg1 = p->npages;
+        for (uint64_t pg = pg0; pg < pg1; ) {
+            uint64_t run0 = pg;
+            while (pg < pg1 && p->up[pg] && !p->hot[pg] && !(p->owned && p->owned[pg]) && !atomic_load(&p->gpu_pending[pg])) pg++;
+            if (pg == run0) { pg++; continue; }
+            for (uint64_t k = run0; k < pg; ) {   // the pages written (or otherwise behind) since their copy; a page whose bytes matched and is still protected is current as it is
+                if (!nvn_dirty_since_span(p->span, (const void *)(p->base + k * PAGE), PAGE, p->up[k])) { k++; continue; }
+                uint64_t k0 = k; while (k < pg && nvn_dirty_since_span(p->span, (const void *)(p->base + k * PAGE), PAGE, p->up[k])) k++;
+                uint64_t stamp = nvn_dirty_now();
+                nvn_dirty_protect((const void *)(p->base + k0 * PAGE), (size_t)((k - k0) * PAGE));
+                for (uint64_t q = k0; q < k; q++) {
+                    const void *gp = (const void *)(p->base + q * PAGE), *dp = data + (p->base + q * PAGE - addr);
+                    if (!memcmp(gp, dp, PAGE) && !atomic_load(&p->gpu_pending[q])) { p->up[q] = stamp; atomic_fetch_add(&s_wb_adopted, 1);
+                        if (wb_verify_on()) { pthread_mutex_lock(&g_av.lk); if (g_av.n < 2048) g_av.addr[g_av.n++] = (uint64_t)(uintptr_t)gp; pthread_mutex_unlock(&g_av.lk); } }
+                    else atomic_fetch_add(&s_wb_adopt_miss, 1);
+                }
+            }
+        }
+    }
+    plat_rw_rdunlock(&g_lk);
+}
 static void wb_land(void *arg) {
     wb_t *w = arg;
     if (w->kind == 0) nanfix(w);
-    dm_guest_write_prepare((void *)(uintptr_t)w->addr, (size_t)w->len);
     uint8_t *d = (uint8_t *)(uintptr_t)w->addr;
-    if (w->kind == 0) memcpy(d, w->mem.map, (size_t)w->len);
-    else if (w->kind == 1) memcpy(d, w->cpu, (size_t)w->len);
-    else for (uint64_t i = 0; i < w->len; i++) d[i] = (uint8_t)(w->fill >> 8 * (i & 3));
+    if (w->kind == 0) wb_apply(w->addr, w->len, w->mem.map);
+    else if (w->kind == 1) wb_apply(w->addr, w->len, w->cpu);
+    else { dm_guest_write_prepare((void *)(uintptr_t)w->addr, (size_t)w->len); for (uint64_t i = 0; i < w->len; i++) d[i] = (uint8_t)(w->fill >> 8 * (i & 3)); }
     gpu_pending(w->addr, w->len, -1);
+    if (w->kind == 0) wb_adopt(w->addr, w->len, w->mem.map); else if (w->kind == 1) wb_adopt(w->addr, w->len, w->cpu);
     atomic_fetch_add(&s_wb_bytes, w->len);
     if (w->buf) { vkDestroyBuffer(g_vk.dev, w->buf, NULL); vk_free_mem(&w->mem); }
     free((void *)w->cpu); free(w);
@@ -973,9 +1116,10 @@ void vkm_frame_tick(uint64_t frame) {
     static vkm_stats_t prev; static uint64_t prev_frame, t_prev;
     wbl_report(frame);
     g_frame = frame + 1; g_budget_used = 0;
+    if (frame % 15 == 0) wb_verify();
     if (frame % HOT_COOL_FRAMES == 0) {   // hot pages cool down: protected again at their next copy; written again, they come back within HOT_STREAK frames
         plat_rw_rdlock(&g_lk);
-        for (int i = 0; i < g_npool; i++) { pool_t_ *p = g_pool[i]; for (uint64_t k = 0; k < p->npages; k++) if (p->hot[k]) { p->hot[k] = 0; p->up[k] = 0; p->streak[k] = 0; } p->hot_n = 0; }   // copied (and protected) again at the next sync
+        for (int i = 0; i < g_npool; i++) { pool_t_ *p = g_pool[i]; for (uint64_t k = 0; k < p->npages; k++) if (p->hot[k]) { p->hot[k] = 0; p->up[k] = 0; p->streak[k] = 0; } p->hot_n = 0; p->clean_epoch = 0; }   // copied (and protected) again at the next sync
         plat_rw_rdunlock(&g_lk);
     }
     { static uint64_t last_rep; if (frame % 100 == 0 && frame != last_rep) { upload_report(frame - last_rep > 1000 ? 100 : frame - last_rep, 0); last_rep = frame; } }
@@ -990,7 +1134,9 @@ void vkm_frame_tick(uint64_t frame) {
           (double)(s.faults - prev.faults) / df, (s.fault_ns - prev.fault_ns) / 1e6 / df, (double)(s.preps - prev.preps) / df,
           (s.writeback_bytes - prev.writeback_bytes) / 1024.0 / df, (s.uncommitted_pages - prev.uncommitted_pages) * 4096.0 / 1048576.0 / df, (double)(s.recopy_pages - prev.recopy_pages) / df, (unsigned long long)s.hot_pages, (unsigned long long)s.staging_overflow,
           (unsigned long long)s.staging_waits, usage / 1048576.0, budget / 1048576.0, secs > 0 ? "" : "");
-    VKLOG("pool_sync time in all: %.0f ms asking the OS about pages, %.0f ms copying guest memory, %.0f ms protecting pages, %.0f ms binding sparse memory / waiting for staging; %llu MB of uncommitted pages skipped (known zero)", atomic_load(&s_t_query) / 1e6, atomic_load(&s_t_copy) / 1e6, atomic_load(&s_t_prot) / 1e6, atomic_load(&s_t_bind) / 1e6, (unsigned long long)(atomic_load(&s_unc_skipped) * PAGE >> 20));
+    VKLOG("pool_sync time in all: %.0f ms asking the OS about pages, %.0f ms copying guest memory, %.0f ms protecting pages, %.0f ms binding sparse memory / waiting for staging (of which %.0f ms waiting for the GPU to free the ring, %.0f ms making overflow buffers); %llu MB of uncommitted pages skipped (known zero)", atomic_load(&s_t_query) / 1e6, atomic_load(&s_t_copy) / 1e6, atomic_load(&s_t_prot) / 1e6, atomic_load(&s_t_bind) / 1e6, atomic_load(&s_t_stwait) / 1e6, atomic_load(&s_t_stovf) / 1e6, (unsigned long long)(atomic_load(&s_unc_skipped) * PAGE >> 20));
+    if (atomic_load(&s_sync_skipped)) VKLOG("pool scans up to frame %llu: %llu skipped as unwritten since a complete pass (%llu found behind guest memory by the check)", (unsigned long long)frame, (unsigned long long)atomic_load(&s_sync_skipped), (unsigned long long)atomic_load(&s_sync_skip_bad));
+    if (atomic_load(&s_wb_adopted) + atomic_load(&s_wb_adopt_miss)) VKLOG("write-back adoption up to frame %llu: %llu pages kept current without a copy back (%.0f MB), %llu not (CPU wrote them first); %.0f MB of the write-backs already matched guest memory and were not written; verify: %llu pages checked, %llu differ", (unsigned long long)frame, (unsigned long long)atomic_load(&s_wb_adopted), atomic_load(&s_wb_adopted) * PAGE / 1048576.0, (unsigned long long)atomic_load(&s_wb_adopt_miss), atomic_load(&s_wb_same) / 1048576.0, (unsigned long long)atomic_load(&s_av_checked), (unsigned long long)atomic_load(&s_av_bad));
     if (atomic_load(&s_own_pages)) VKLOG("GPU-owned pages up to frame %llu: %llu pages (%llu shadows), %llu words applied in place from the CPU, %llu whole pages first copied", (unsigned long long)frame, (unsigned long long)atomic_load(&s_own_pages), (unsigned long long)atomic_load(&g_shadow_pages), (unsigned long long)atomic_load(&s_own_words), (unsigned long long)atomic_load(&s_own_full));
     if (atomic_load(&s_gmem_programs)) VKLOG("global memory up to frame %llu: %llu programs bound, %llu pointers followed, %llu pool syncs for them (%.0f MB of CPU-rewritten pages sent unbudgeted), page table %llu of %llu words", (unsigned long long)frame,
           (unsigned long long)atomic_load(&s_gmem_programs), (unsigned long long)atomic_load(&s_gmem_touches), (unsigned long long)atomic_load(&s_gmem_syncs), atomic_load(&s_gmem_dirty_bytes) / 1048576.0, (unsigned long long)g_gt.next, (unsigned long long)g_gt.words);
@@ -1042,7 +1188,7 @@ void vkm_shutdown(void) {
     plat_rw_wrunlock(&g_lk);
     if (g_gt.buf) { vkDestroyBuffer(g_vk.dev, g_gt.buf, NULL); vk_free_mem(&g_gt.mem); memset(&g_gt, 0, sizeof g_gt); }
     plat_rw_wrlock(&g_st.lk);
-    for (unsigned k = g_st.qt; k != g_st.qh; k++) { unsigned i = k % 4096; if (g_st.q[i].ovf) { vkDestroyBuffer(g_vk.dev, g_st.q[i].ovf, NULL); vk_free_mem(&g_st.q[i].ovf_mem); } }
+    for (unsigned k = g_st.qt; k != g_st.qh; k++) { unsigned i = k % ST_Q; if (g_st.q[i].ovf) { vkDestroyBuffer(g_vk.dev, g_st.q[i].ovf, NULL); vk_free_mem(&g_st.q[i].ovf_mem); } }
     g_st.qt = g_st.qh = 0;
     if (g_st.buf) { vkDestroyBuffer(g_vk.dev, g_st.buf, NULL); vk_free_mem(&g_st.mem); g_st.buf = VK_NULL_HANDLE; }
     plat_rw_wrunlock(&g_st.lk);

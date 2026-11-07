@@ -7,7 +7,11 @@
 layout(location = 0) in vec2 uv;
 layout(location = 0) out vec4 o;
 layout(set = 0, binding = 0) uniform sampler2D src;
-layout(push_constant) uniform PC { vec4 rect; vec4 misc; vec4 sharp; } pc;   // sharp.x: sharpness 0..1
+layout(push_constant) uniform PC { vec4 rect; vec4 misc; vec4 sharp;
+#ifdef PRESENT_COLOR
+    vec4 color;
+#endif
+} pc;   // sharp.x: sharpness 0..1
 
 vec3 texel(ivec2 q, ivec2 lo, ivec2 hi) { return texelFetch(src, clamp(q, lo, hi), 0).rgb; }
 vec3 sharpened(ivec2 q, ivec2 lo, ivec2 hi, float peak) {
@@ -19,8 +23,20 @@ vec3 sharpened(ivec2 q, ivec2 lo, ivec2 hi, float peak) {
     return clamp((c + (n + s + w + e) * k) / (1.0 + 4.0 * k), 0.0, 1.0);
 }
 
+#ifdef PRESENT_COLOR
+vec3 colorize(vec3 c) {
+    if (pc.sharp.y == 0.0) return c;
+    c = max(c * pc.sharp.z, vec3(0.0));
+    float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    c = max(mix(vec3(l), c, pc.sharp.w), vec3(0.0));
+    return pow(c, vec3(1.0 / pc.color.x));
+}
+#else
+#define colorize(c) (c)
+#endif
+
 void main() {
-    if (pc.misc.x < 0.5) { o = vec4(texture(src, uv).rgb, 1.0); return; }
+    if (pc.misc.x < 0.5) { o = vec4(colorize(texture(src, uv).rgb), 1.0); return; }
     if (pc.misc.x > 1.5) {
         vec2 ts = vec2(textureSize(src, 0));
         ivec2 lo = ivec2(floor(min(pc.rect.xy, pc.rect.zw) * ts)), hi = ivec2(ceil(max(pc.rect.xy, pc.rect.zw) * ts)) - 1;   // the crop, either way up
@@ -28,7 +44,7 @@ void main() {
         float peak = -1.0 / mix(8.0, 5.0, clamp(pc.sharp.x, 0.0, 1.0));
         vec3 a = sharpened(i, lo, hi, peak), b = sharpened(i + ivec2(1, 0), lo, hi, peak);
         vec3 c = sharpened(i + ivec2(0, 1), lo, hi, peak), d = sharpened(i + ivec2(1, 1), lo, hi, peak);
-        o = vec4(mix(mix(a, b, f.x), mix(c, d, f.x), f.y), 1.0);
+        o = vec4(colorize(mix(mix(a, b, f.x), mix(c, d, f.x), f.y)), 1.0);
         return;
     }
     vec2 t = clamp((uv - pc.rect.xy) / (pc.rect.zw - pc.rect.xy), 0.0, 1.0);

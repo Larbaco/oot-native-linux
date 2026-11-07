@@ -79,6 +79,18 @@ python3 -m venv .venv
 
 Logs are written next to `nxs2.py` as `setup-*.log`. Running `setup` again is safe. It skips work that is already done.
 
+### Where the shader translator is
+
+The repository carries no prebuilt translator. `setup` publishes the one it built to `$NXS2_BIN` (default `bin/` next to `nxs2.py`) and keeps a copy
+in `nxnative/dm/gfx/tools/dmsh_xlate_bin/`; `nxs2.py` passes that folder to `nxshader.py` with `--xlate`. The developer tools that run `nxshader.py`
+on their own (`tools/ndsr_validate.py`, the `nxshader.spirv_val_sample` test) look in the same places, in this order: `$NXS2_BIN`, `bin/`,
+`nxnative/dm/gfx/tools/dmsh_xlate_bin/`, and, in a packaged runtime, `installer/host/windows/dmsh_xlate_bin/`. Without a `dmsh_xlate.dll` in any of
+them they stop with a message naming the folders they tried. To use a translator built elsewhere, pass `--xlate <folder>` to `nxshader.py` or set
+`NXS2_BIN`.
+
+A shader cache is tied to the translator that made it: `nxshader.py` derives the cache's chain id from the translator's source hash and the hashes of
+its DLLs, so a translator built from a different source or toolchain has a different chain and does not reuse an older cache.
+
 ## 4. Validate your dump
 
 ```sh
@@ -144,3 +156,37 @@ cmake -S windows -B windows/build/linux-0400486024DEC000 -G Ninja -DNXRT_GAME=04
       -DNXW_LLVM_DIR=<LLVM 23 prefix> -DNXRT_SDL3_DIR=<SDL3 prefix> -DNXRT_VK_INCLUDE=<Vulkan headers>/include
 cmake --build windows/build/linux-0400486024DEC000
 ```
+
+### Keeping the toolchains outside the clone (development builds)
+
+`setup` puts LLVM, SDL3 and the Vulkan headers in `toolchains/` next to `nxs2.py`. A development checkout that has several build folders or worktrees can keep
+one copy elsewhere and point every build at it with `NXL_TOOLCHAINS=<dir>`. A build folder must never point into another project's or another
+build job's work area: if that folder is cleaned, the compiler and the SDL3 library (`nxrt` has the SDL3 `lib` folder in its `RUNPATH`) disappear with it.
+
+Fetch the toolchains once, without running the rest of `setup` (this is what `setup` runs first; it is skipped for anything already there):
+
+```sh
+NXL_TOOLCHAINS=~/dev/toolchains python3 -I -c "import sys; sys.path.insert(0, '.'); import nxs2, nxs2_linux as L; L.fetch_toolchain(nxs2)"
+```
+
+Then (re)configure and build the folder against it, with the same options `setup` uses (`-DNXRT_ENABLE_FFMPEG=ON` builds the movie decoder; drop it if FFmpeg's
+development packages are not installed). Reconfiguring onto a different compiler path rebuilds everything once:
+
+```sh
+T=~/dev/toolchains
+rm -rf windows/build/linux-0400486024DEC000/CMakeCache.txt windows/build/linux-0400486024DEC000/CMakeFiles   # only when moving an existing folder
+PATH=$T/llvm-23.1.4/bin:$PATH cmake -S windows -B windows/build/linux-0400486024DEC000 -G Ninja -DNXRT_GAME=0400486024DEC000 -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DNXW_LLVM_DIR=$T/llvm-23.1.4 -DNXRT_SDL3_DIR=$T/SDL3-3.4.18 \
+      -DNXRT_VK_INCLUDE=$T/vulkan-headers/include -DNXRT_ENABLE_FFMPEG=ON
+PATH=$T/llvm-23.1.4/bin:$PATH cmake --build windows/build/linux-0400486024DEC000
+LD_LIBRARY_PATH=$T/llvm-23.1.4/lib NXS2_ZBIC_UNPACK=$PWD/windows/build/linux-0400486024DEC000/bin/zbic-unpack ctest --test-dir windows/build/linux-0400486024DEC000
+```
+
+Without a dump, `ctest` should report every test passed and three skipped (`nxanalyze.dump`, `s2tex.corpus`, `nxshader.spirv_val_sample`: they need a dump or
+corpus). Check that nothing points outside your folders: `grep -c '<some other work area>' windows/build/*/CMakeCache.txt` and `readelf -d <build>/bin/nxrt | grep RUNPATH`.
+
+### Running a build from a dump you already extracted
+
+`nxrt` and `nxload` refuse a ZBIC-compressed `main`: it must be normalized first by the separate `zbic-unpack` tool (`nxs2.py build` does this in the build's
+private ExeFS copy). If you run `nxrt` by hand on an ExeFS folder taken straight from a dump, copy the folder and run `zbic-unpack <copy>/main` (it works in place);
+never unpack the only copy you have.

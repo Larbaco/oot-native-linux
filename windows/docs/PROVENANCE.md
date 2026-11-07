@@ -31,3 +31,23 @@ game executable code, RomFS assets, firmware, keys, saves, or game-derived shade
 data. Release tests use synthetic instruction encodings and synthetic fixtures.
 Internal research notes and other-game profiles are excluded from release source
 and packages by `release/allowlist.txt`.
+
+## Present FSR1
+
+- AMD FidelityFX FSR1 headers `ffx_a.h` and `ffx_fsr1.h`: MIT, copyright
+  2021 Advanced Micro Devices, Inc.; copied from sostenesfreitas/ocarina-recomp
+  commit `f328427034dd3e8b2b2cc5e15ed13da6304d392b`, destination
+  `src/nxrt/vk/shaders/ffx/`. The MIT notice is retained there and in
+  `LICENSES/FidelityFX-FSR1-MIT.txt`.
+- The EASU and RCAS shader wrappers derive from sostenesfreitas/ocarina-recomp
+  commit `f328427034dd3e8b2b2cc5e15ed13da6304d392b`, GPL-3.0-or-later;
+  destination `src/nxrt/vk/shaders/fsr_easu.comp` and `fsr_rcas.comp`.
+  The release binaries are GPL-3.0-or-later.
+
+## Ports from the upstream project (MIT)
+
+Small, attributed ports of MIT-licensed work from the upstream project credited in the top-level `README.md`, under the licence in `LICENSES/MIT-project.txt`, re-applied by hand to this tree (upstream commit hashes and issues below):
+
+- `56be9d26`: the Linux dynamic-export list (`windows/src/nxrt/plat/linux/nxrt.dynlist`) and its test (`tests/check_exports.cmake`), for issue #30 (found by apocal26).
+- `1762d91` (linux-beta 3): the PipeWire audio reserve in `windows/src/nxrt/front/audio_sdl.c` and the `hle/` audio callbacks (diagnosed by Quantumenis).
+- `77d1060`: the `NXRT_VK_ROBUST` robust-access switch in `windows/src/nxrt/vk/vk_dev.c` (only that hunk; the default is unchanged).

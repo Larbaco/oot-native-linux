@@ -171,19 +171,29 @@ static void au_render(void *ctx, uint8_t *dst, uint64_t bytes) {
     { static int mute = -1; if (mute < 0) { const char *e = getenv("DM_AUDIO_MUTE"); mute = e && atoi(e); }   // diagnostic: the whole real-output path but with the output silenced
       if (mute) memset(dst, 0, bytes); }
 }
+// Frames appended and not yet pulled, for the device backend's reserve (it pulls only these, so it never pads). Only the consumer side calls it, so the blocks
+// between head and tail stay put while it adds them up
+static uint32_t au_ready(void *ctx) {
+    aout *a = ctx;
+    uint32_t qh = atomic_load_explicit(&a->q_head, memory_order_relaxed), qt = atomic_load_explicit(&a->q_tail, memory_order_acquire);
+    if (qh == qt || atomic_load_explicit(&a->state, memory_order_acquire) != STATE_STARTED) return 0;
+    uint64_t bytes = 0;
+    for (uint32_t i = qh; i != qt; i++) bytes += a->q[i & (QMAX - 1)]->size;
+    return (uint32_t)((bytes - a->pos) / (2u * (unsigned)a->ch));
+}
 // The silent sink's pull: the guest's channels as they are (the sink takes any count)
 static void null_pull(void *ctx, uint8_t *dst, uint64_t bytes) { pull(ctx, dst, bytes); }
 static void au_dispose(aout *a) { if (a->au) a->dev_be->close(a->au); a->au = NULL; }
 static int au_create(aout *a) {
     a->dev_be = audio_out_device(); a->au = NULL;
     if (!a->dev_be) return -1;
-    a->au = a->dev_be->open(device_channels(a), RATE, au_render, a);
+    a->au = a->dev_be->open(device_channels(a), RATE, au_render, au_ready, a);
     return a->au ? 0 : -1;
 }
 // Backend changes; callers hold g_aos_lock. pull() takes no lock, so stopping a sink under it cannot deadlock
 static void null_start(aout *a) {
     const audio_out_backend *s = audio_out_silent();
-    a->null_dev = s->open(a->ch, RATE, null_pull, a);
+    a->null_dev = s->open(a->ch, RATE, null_pull, NULL, a);
     if (!a->null_dev || s->start(a->null_dev)) die("audio #%d: the silent sink cannot start", a->id);
     a->backend = BK_NULL;
 }
@@ -457,6 +467,7 @@ void dm_pcmout_close(void *k) { au_close(k, NULL); free(k); }   // stop, take it
 int dm_pcmout_append(void *k, void *b) { return (int)h_au_Append(k, b); }
 void *dm_pcmout_released(void *k) { return h_au_Released(k); }
 uint64_t dm_pcmout_released_count(void *k) { return atomic_load(&ao(k)->released_n); }   // tests: blocks played to the end so far
+uint64_t dm_pcmout_underruns(void *k) { return atomic_load(&ao(k)->under_n); }            // tests: pulls that found the queue empty
 
 // Front-end lifecycle (going to background): suspend device output, with the silent sink taking over real-time consumption meanwhile (pacing unbroken); switch back to the device on resume.
 // The front end calls with 1 on going to background, and with 0 on returning to foreground.

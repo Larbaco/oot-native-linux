@@ -26,13 +26,18 @@ message(STATUS "nxrt: Vulkan backend with SDL3 ${SDL3_VERSION} (${NXRT_SDL3_DIR}
 
 # The backend's own shaders, compiled to SPIR-V headers
 set(_spv)
-foreach(sh present.vert present.frag test_fill.comp test_pervertex.vert test_pervertex_cull.vert test_bind.frag clear.vert clear_f.frag clear_u.frag clear_i.frag test_dual.frag test_tri.vert movie_yuv.comp ind_clamp.comp ndsr_blit.comp test_ballot.comp test_ballot_used.comp)
+foreach(sh present.vert present.frag fsr_easu.comp fsr_rcas.comp test_fill.comp test_pervertex.vert test_pervertex_cull.vert test_bind.frag clear.vert clear_f.frag clear_u.frag clear_i.frag test_dual.frag test_tri.vert movie_yuv.comp ind_clamp.comp ndsr_blit.comp test_ballot.comp test_ballot_used.comp)
   string(REPLACE "." "_" var ${sh})
   add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${var}.h
     COMMAND ${NXRT_GLSLANG} -V --target-env vulkan1.3 --vn ${var}_spv -o ${CMAKE_CURRENT_BINARY_DIR}/${var}.h ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${sh}
-    DEPENDS shaders/${sh} VERBATIM)
+    DEPENDS shaders/${sh} shaders/ffx/ffx_a.h shaders/ffx/ffx_fsr1.h VERBATIM)
   list(APPEND _spv ${CMAKE_CURRENT_BINARY_DIR}/${var}.h)
 endforeach()
+
+add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/present_color_frag.h
+  COMMAND ${NXRT_GLSLANG} -V --target-env vulkan1.3 -DPRESENT_COLOR=1 --vn present_color_frag_spv -o ${CMAKE_CURRENT_BINARY_DIR}/present_color_frag.h ${CMAKE_CURRENT_SOURCE_DIR}/shaders/present.frag
+  DEPENDS shaders/present.frag VERBATIM)
+list(APPEND _spv ${CMAKE_CURRENT_BINARY_DIR}/present_color_frag.h)
 
 # Third party (third_party/*/LICENSE*, docs/PROVENANCE.md): astc-encoder 5.7.0 (Apache-2.0), bc7enc_rdo b943862 (MIT / Unlicense)
 file(GLOB _astcenc_src CONFIGURE_DEPENDS third_party/astcenc/*.cpp)
@@ -43,7 +48,7 @@ add_library(nxrt_bc7enc STATIC third_party/bc7enc/bc7enc.cpp third_party/bc7enc/
 target_compile_options(nxrt_bc7enc PRIVATE -w)
 
 add_library(nxrt_vk OBJECT
-  gfx_vk.c vk_fn.c vk_dev.c vk_window.c vk_submit.c vk_present.c vk_pcache.c vk_mem.c vk_rdwatch.c vk_fmt.c vk_tex.c vk_astc.cpp
+  gfx_vk.c vk_fn.c vk_dev.c vk_window.c vk_submit.c vk_present.c vk_fsr.c vk_pcache.c vk_mem.c vk_rdwatch.c vk_fmt.c vk_tex.c vk_astc.cpp
   vk_json.c vk_shader.c vk_pipe.c vk_replay.c vk_shot.c ${_spv})
 target_include_directories(nxrt_vk PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR} "${NXRT_VK_INCLUDE}" "${NXRT_SDL3_DIR}/include"
   ${CMAKE_CURRENT_SOURCE_DIR}/../plat ${CMAKE_CURRENT_SOURCE_DIR}/../gfx ${CMAKE_CURRENT_SOURCE_DIR}/../host ${CMAKE_CURRENT_SOURCE_DIR}/../front ${CMAKE_SOURCE_DIR}/src/s2tex)

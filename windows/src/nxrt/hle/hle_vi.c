@@ -114,7 +114,12 @@ HLE_FORCE("_ZN2nn2vi21QueryDisplayHdrStatusEPbPNS0_15HdrOutputFormatEPtPKNS0_7Di
 }
 HLE_FORCE("_ZN2nn2vi25QueryDisplayHdrPaperWhiteEPtPKNS0_7DisplayE", "SWITCH2: HDR paper white of the display (nits); the host presents SDR", Result, h_vi_QPaper, uint16_t *out, const void *disp) {
     uint16_t v = (uint16_t)hdr_env("NXRT_HDR_PAPER", 0, 0);
-    LOG("vi::QueryDisplayHdrPaperWhite(disp=%p) -> %u", disp, v);
+    // logged on the first call and whenever the value changes (the game asks every frame); NXRT_LOG_VERBOSE=1 logs every call
+    static _Atomic int last_paper = -1;
+    static int verbose = -1;
+    if (verbose < 0) { const char *e = getenv("NXRT_LOG_VERBOSE"); verbose = e && *e && *e != '0'; }
+    int prev = atomic_exchange(&last_paper, (int)v);
+    if (verbose || prev != (int)v) LOG("vi::QueryDisplayHdrPaperWhite(disp=%p) -> %u", disp, v);
     if (out) *out = v; return 0;
 }
 
