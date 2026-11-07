@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
-# Build, stage, scan, and archive the complete private v0.1.2 release.
+# Build, stage, scan, and archive the complete private v0.1.3 release.
 set -euo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-WORK=${OOT_RELEASE_WORK:-${XDG_CACHE_HOME:-${TMPDIR:-/tmp}}/oot-release-work}
+WORK=${OOT_RELEASE_WORK:-${XDG_CACHE_HOME:-$HOME/.cache}/oot-native-release}
 JOBS=${NXS2_JOBS:-8}
 BRANCH=$(git -C "$ROOT" branch --show-current)
-if [[ "$BRANCH" != "release/v0.1.1" ]]; then
-  echo "make-release: expected branch release/v0.1.1, got $BRANCH" >&2
+if [[ "$BRANCH" != "feat/movie-decode" ]]; then
+  echo "make-release: expected branch feat/movie-decode, got $BRANCH" >&2
   exit 2
 fi
 if ! command -v docker >/dev/null; then
   echo "make-release: Docker is required for the Ubuntu 22.04 build" >&2
   exit 2
 fi
-if ! [[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || (( JOBS > 10 )); then
-  echo "make-release: NXS2_JOBS must be between 1 and 10" >&2
+if ! [[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || (( JOBS > 12 )); then
+  echo "make-release: NXS2_JOBS must be between 1 and 12" >&2
   exit 2
 fi
 mkdir -p "$WORK"
@@ -25,9 +25,8 @@ if [[ "$WORK" == / || "$WORK" == "$ROOT" || "$WORK" == "$ROOT/"* ]]; then
   echo "make-release: refusing an unsafe workspace location: $WORK" >&2
   exit 2
 fi
-
-VERSION=v0.1.2
-IMAGE=oot-native-release-builder:ubuntu22.04
+VERSION=v0.1.3
+IMAGE=oot-native-release-builder:v013-movie
 SRC="$WORK/source-$VERSION"
 RELEASE_DATE=${OOT_RELEASE_DATE:-$(date +%F)}
 if [[ ! "$RELEASE_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
@@ -44,12 +43,15 @@ SOURCE_TARBALL="$WORK/$SOURCE_NAME-candidate-$ATTEMPT_TAG.tar.xz"
 PACKAGE_TARBALL="$WORK/$PKG_NAME-candidate-$ATTEMPT_TAG.tar.xz"
 FINAL_SOURCE_TARBALL="$WORK/$SOURCE_NAME.tar.xz"
 FINAL_PACKAGE_TARBALL="$WORK/$PKG_NAME.tar.xz"
+THIRDPARTY_NAME="$PKG_NAME-thirdparty-source"
+THIRDPARTY_STAGE="$WORK/thirdparty-source-stage/$THIRDPARTY_NAME"
+THIRDPARTY_TARBALL="$WORK/$THIRDPARTY_NAME.tar.xz"
 NEGATIVE="$WORK/negative-$VERSION"
 DOCKER_CONTEXT="$WORK/docker-context"
 SMOKE="$WORK/package-smoke-$RELEASE_DATE"
-SMOKE_IMAGE=oot-native-package-smoke:ubuntu22.04
+SMOKE_IMAGE=oot-native-package-smoke:v013-movie
 SOURCE_DATE_EPOCH=$(git -C "$ROOT" show -s --format=%ct HEAD)
-REFERENCE_PACKAGE=${OOT_REFERENCE_PACKAGE:-$WORK/oot-native-linux-x86_64-v0.1.0-2026-11-06}
+REFERENCE_PACKAGE=${OOT_REFERENCE_PACKAGE:?make-release: set OOT_REFERENCE_PACKAGE to the v0.1.0 package root}
 
 wait_for_artifact_notice() {
   local kind=$1 gate="$WORK/.continue-after-$1"
@@ -60,8 +62,19 @@ wait_for_artifact_notice() {
   fi
 }
 
-if [[ -e "$FINAL_SOURCE_TARBALL" || -e "$FINAL_PACKAGE_TARBALL" || \
-      -e "$FINAL_SOURCE_TARBALL.sha256" || -e "$FINAL_PACKAGE_TARBALL.sha256" ]]; then
+require_root_space() {
+  local available_kb
+  available_kb=$(df -Pk / | awk 'NR==2 {print $4}')
+  if [[ ! "$available_kb" =~ ^[0-9]+$ ]] || (( available_kb < 12582912 )); then
+    df -h /
+    echo "make-release: stopping; / must retain at least 12 GiB free" >&2
+    exit 2
+  fi
+  df -h /
+}
+
+if [[ -e "$FINAL_SOURCE_TARBALL" || -e "$FINAL_PACKAGE_TARBALL" || -e "$THIRDPARTY_TARBALL" || \
+      -e "$FINAL_SOURCE_TARBALL.sha256" || -e "$FINAL_PACKAGE_TARBALL.sha256" || -e "$THIRDPARTY_TARBALL.sha256" || -e "$WORK/SHA256SUMS" ]]; then
   echo "make-release: final archive name already exists; preserve or rename it before publishing" >&2
   exit 2
 fi
@@ -73,7 +86,7 @@ fi
 # Keep downloaded toolchains and Python source in WORK for incremental rebuilds;
 # clear only outputs owned by this release invocation.
 rm -rf "$SRC" "$PKG" "$WORK/source-stage" "$ART/upstream-source" "$WORK/launcher-venv" \
-  "$WORK/pyinstaller-work" "$WORK/$SOURCE_NAME" "$NEGATIVE" "$DOCKER_CONTEXT" "$SMOKE"
+  "$WORK/pyinstaller-work" "$WORK/$SOURCE_NAME" "$NEGATIVE" "$DOCKER_CONTEXT" "$SMOKE" "$WORK/thirdparty-source-stage"
 rm -f "$SOURCE_TARBALL" "$PACKAGE_TARBALL" "$WORK/package-allowlist.txt" \
   "$WORK/glibc-baseline.txt" "$WORK/launcher-help.txt" "$WORK/build-result.txt" \
   "$WORK/setup.log" "$WORK/ctest-build.log" "$WORK/ctest.log" \
@@ -95,13 +108,15 @@ if [[ -d "$NXNATIVE_CACHE/.git" ]] && \
 fi
 
 echo "make-release: building Ubuntu 22.04 release image"
+require_root_space
 mkdir -p "$DOCKER_CONTEXT"
 install -m 0644 "$SRC/release/Dockerfile.ubuntu22.04" "$DOCKER_CONTEXT/Dockerfile.ubuntu22.04"
-nice -n 19 ionice -c3 docker build --pull -t "$IMAGE" -f "$DOCKER_CONTEXT/Dockerfile.ubuntu22.04" "$DOCKER_CONTEXT"
+nice -n 19 ionice -c3 docker build -t "$IMAGE" -f "$DOCKER_CONTEXT/Dockerfile.ubuntu22.04" "$DOCKER_CONTEXT"
 
 echo "make-release: compiling tools and staging bundle in Ubuntu 22.04"
+require_root_space
 nice -n 19 ionice -c3 docker run --rm --cpus="$JOBS" -e NXS2_JOBS="$JOBS" \
-  -e NXS2_RELEASE_PKG_NAME="$PKG_NAME" \
+  -e NXS2_RELEASE_PKG_NAME="$PKG_NAME" -v /:/host-root:ro \
   -v "$SRC:/src" -v "$WORK:/out" "$IMAGE" /bin/bash /src/release/build-in-container.sh
 
 test -x "$PKG/oot-native-launcher"
@@ -112,6 +127,23 @@ test -x "$PKG/builder/bin/zbic-unpack"
 test -x "$PKG/builder/ampere-lower/ampere-lower"
 test -f "$PKG/builder/bin/dmsh_xlate.dll"
 test -f "$PKG/builder/lib/libSDL3.so.0"
+test -x "$PKG/builder/bin/nxrt-movie-decode"
+test -f "$PKG/builder/lib/libavcodec.so.61"
+test -f "$PKG/builder/lib/libdav1d.so.7"
+
+# Keep the exact, checksum-pinned upstream source tarballs adjacent to the
+# binary release. The package itself records this companion archive by name.
+mkdir -p "$THIRDPARTY_STAGE"
+cp -a "$WORK/codec-source/ffmpeg-7.1.1.tar.xz" "$THIRDPARTY_STAGE/"
+cp -a "$WORK/codec-source/dav1d-1.5.1.tar.xz" "$THIRDPARTY_STAGE/"
+cat > "$THIRDPARTY_STAGE/README.txt" <<EOF
+OoT Native $VERSION third-party codec corresponding source
+FFmpeg 7.1.1: LGPL-2.1, SHA-256 733984395e0dbbe5c046abda2dc49a5544e7e0e1e2366bba849222ae9e3a03b1
+dav1d 1.5.1: BSD-2-Clause, SHA-256 401813f1f89fa8fd4295805aa5284d9aed9bc7fc1fdbe554af4292f64cbabe21
+These are the exact source tarballs used to build the packaged codec libraries.
+EOF
+nice -n 19 ionice -c3 tar --owner=0 --group=0 --numeric-owner --sort=name --mtime="@$SOURCE_DATE_EPOCH" \
+  --format=gnu -I 'xz -T8 -6' -cf "$THIRDPARTY_TARBALL" -C "$WORK/thirdparty-source-stage" "$THIRDPARTY_NAME"
 
 while IFS= read -r source; do
   [[ -z "$source" || "$source" == \#* ]] && continue
@@ -144,6 +176,7 @@ python3 "$SOURCE_STAGE/release/release_check.py" "$SOURCE_TARBALL" --allowlist "
 wait_for_artifact_notice source-candidate
 
 install -m 0644 "$SOURCE_TARBALL" "$PKG/$SOURCE_NAME.tar.xz"
+install -m 0644 "$THIRDPARTY_TARBALL" "$PKG/$THIRDPARTY_NAME.tar.xz"
 python3 - "$PKG" <<'PY'
 import pathlib, sys
 root=pathlib.Path(sys.argv[1])
@@ -220,8 +253,11 @@ if external_libraries != licensed:
 print(f'extracted {count} PyInstaller ELF files for ldd validation')
 PY
 echo "make-release: building clean Ubuntu 22.04 runtime-only smoke image"
-nice -n 19 ionice -c3 docker build --pull -t "$SMOKE_IMAGE" -f "$SRC/release/Dockerfile.smoke.ubuntu22.04" "$SRC/release"
+require_root_space
+nice -n 19 ionice -c3 docker build -t "$SMOKE_IMAGE" -f "$SRC/release/Dockerfile.smoke.ubuntu22.04" "$SRC/release"
+require_root_space
 nice -n 19 ionice -c3 docker run --rm --network none --cpus=2 --tmpfs /doctor-space:rw,size=50g \
+  -v /:/host-root:ro \
   -e OOT_REFERENCE_PACKAGE=/reference-package \
   -v "$SMOKE/extracted/$PKG_NAME:/pkg:ro" \
   -v "$REFERENCE_PACKAGE:/reference-package:ro" \
@@ -240,6 +276,7 @@ echo "make-release: publishing scanned candidate archives to their dated final n
 install -m 0644 "$SOURCE_TARBALL" "$FINAL_SOURCE_TARBALL"
 cmp -s "$SOURCE_TARBALL" "$FINAL_SOURCE_TARBALL"
 (cd "$WORK" && sha256sum "$(basename "$FINAL_SOURCE_TARBALL")" > "$(basename "$FINAL_SOURCE_TARBALL").sha256")
+(cd "$WORK" && sha256sum "$THIRDPARTY_NAME.tar.xz" > "$THIRDPARTY_NAME.tar.xz.sha256")
 wait_for_artifact_notice source-final
 install -m 0644 "$PACKAGE_TARBALL" "$FINAL_PACKAGE_TARBALL"
 cmp -s "$PACKAGE_TARBALL" "$FINAL_PACKAGE_TARBALL"
@@ -247,8 +284,11 @@ cmp -s "$PACKAGE_TARBALL" "$FINAL_PACKAGE_TARBALL"
 wait_for_artifact_notice package-final
 
 echo "make-release: final artifact evidence"
-stat -c '%n %s bytes' "$FINAL_PACKAGE_TARBALL" "$FINAL_SOURCE_TARBALL"
+stat -c '%n %s bytes' "$FINAL_PACKAGE_TARBALL" "$FINAL_SOURCE_TARBALL" "$THIRDPARTY_TARBALL"
 sha256sum "$FINAL_PACKAGE_TARBALL" "$FINAL_SOURCE_TARBALL"
+sha256sum "$WORK/$THIRDPARTY_NAME.tar.xz"
+(cd "$WORK" && sha256sum "$(basename "$FINAL_PACKAGE_TARBALL")" "$(basename "$FINAL_SOURCE_TARBALL")" "$THIRDPARTY_NAME.tar.xz" > SHA256SUMS)
+cat "$WORK/SHA256SUMS"
 cat "$WORK/glibc-baseline.txt"
 cat "$WORK/ctest.log"
 tail -5 "$WORK/python-tests.log"

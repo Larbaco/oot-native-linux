@@ -9,18 +9,93 @@ PKG_NAME=${NXS2_RELEASE_PKG_NAME:-oot-native-linux-x86_64-v0.1.0}
 PKG="$OUT/$PKG_NAME"
 ART="$OUT/artifacts"
 JOBS=${NXS2_JOBS:-8}
-if ! [[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || (( JOBS > 10 )); then
-  echo "NXS2_JOBS must be between 1 and 10" >&2
+if ! [[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || (( JOBS > 12 )); then
+  echo "NXS2_JOBS must be between 1 and 12" >&2
   exit 2
 fi
+require_root_space() {
+  local root=${OOT_HOST_ROOT:-/host-root} available_kb
+  [[ -d "$root" ]] || root=/
+  available_kb=$(df -Pk "$root" | awk 'NR==2 {print $4}')
+  df -h "$root"
+  if [[ ! "$available_kb" =~ ^[0-9]+$ ]] || (( available_kb < 12582912 )); then
+    echo "release build: stopping; host / must retain at least 12 GiB free" >&2
+    exit 2
+  fi
+}
 PYTHON_VERSION=3.12.12
+MESON_VERSION=1.5.2
+DAV1D_VERSION=1.5.1
+FFMPEG_VERSION=7.1.1
+DAV1D_SHA256=401813f1f89fa8fd4295805aa5284d9aed9bc7fc1fdbe554af4292f64cbabe21
+FFMPEG_SHA256=733984395e0dbbe5c046abda2dc49a5544e7e0e1e2366bba849222ae9e3a03b1
 mkdir -p "$OUT/tmp" "$OUT/toolchains" "$ART" "$PKG/builder/bin" "$PKG/builder/lib" "$PKG/builder/ampere-lower"
+if ! command -v meson >/dev/null; then
+  require_root_space
+  nice -n 19 ionice -c3 /opt/release-venv/bin/python -m pip install --disable-pip-version-check --no-cache-dir "meson==$MESON_VERSION"
+fi
+if ! command -v nasm >/dev/null; then
+  require_root_space
+  nice -n 19 ionice -c3 apt-get update
+  require_root_space
+  nice -n 19 ionice -c3 apt-get install -y --no-install-recommends nasm
+  apt-get clean
+  rm -rf /var/lib/apt/lists/*
+fi
 
+# Pinned, LGPL/BSD codec stack. Keep the exact upstream tarballs for the
+# adjacent third-party-source archive assembled by make-release.sh.
+CODEC_SRC="$OUT/codec-source"
+mkdir -p "$CODEC_SRC"
+DAV1D_TARBALL="$CODEC_SRC/dav1d-$DAV1D_VERSION.tar.xz"
+FFMPEG_TARBALL="$CODEC_SRC/ffmpeg-$FFMPEG_VERSION.tar.xz"
+[[ -s "$DAV1D_TARBALL" ]] || curl -fL --retry 3 "https://download.videolan.org/pub/videolan/dav1d/$DAV1D_VERSION/dav1d-$DAV1D_VERSION.tar.xz" -o "$DAV1D_TARBALL"
+[[ -s "$FFMPEG_TARBALL" ]] || curl -fL --retry 3 "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz" -o "$FFMPEG_TARBALL"
+echo "$DAV1D_SHA256  $DAV1D_TARBALL" | sha256sum -c -
+echo "$FFMPEG_SHA256  $FFMPEG_TARBALL" | sha256sum -c -
+DAV1D_SRC="$OUT/tmp/dav1d-$DAV1D_VERSION"
+FFMPEG_SRC="$OUT/tmp/ffmpeg-$FFMPEG_VERSION"
+CODEC_PREFIX="$OUT/toolchains/codec"
+FFMPEG_CONFIG_STAMP="$CODEC_PREFIX/.ffmpeg-$FFMPEG_VERSION-libdav1d-decoder-configured"
+export PKG_CONFIG_PATH="$CODEC_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+export LD_LIBRARY_PATH="$CODEC_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+if [[ ! -f "$CODEC_PREFIX/lib/pkgconfig/dav1d.pc" ]]; then
+  tar -xf "$DAV1D_TARBALL" -C "$OUT/tmp"
+  if [[ ! -f "$OUT/tmp/dav1d-build/build.ninja" ]]; then rm -rf "$OUT/tmp/dav1d-build"; fi
+  require_root_space
+  nice -n 19 ionice -c3 meson setup "$OUT/tmp/dav1d-build" "$DAV1D_SRC" --prefix="$CODEC_PREFIX" --libdir=lib -Denable_tools=false -Denable_tests=false
+  require_root_space
+  nice -n 19 ionice -c3 ninja -C "$OUT/tmp/dav1d-build" -j "$JOBS"
+  nice -n 19 ionice -c3 ninja -C "$OUT/tmp/dav1d-build" install
+fi
+FFMPEG_LIBDIR=
+if [[ -f "$CODEC_PREFIX/lib/pkgconfig/libavcodec.pc" ]]; then
+  FFMPEG_LIBDIR=$(pkg-config --variable=libdir libavcodec 2>/dev/null || true)
+fi
+if [[ ! -f "$FFMPEG_CONFIG_STAMP" || ! -f "$CODEC_PREFIX/lib/pkgconfig/libavcodec.pc" || "$FFMPEG_LIBDIR" != "$CODEC_PREFIX/lib" ]]; then
+  rm -rf "$FFMPEG_SRC"
+  rm -f "$FFMPEG_CONFIG_STAMP"
+  tar -xf "$FFMPEG_TARBALL" -C "$OUT/tmp"
+  require_root_space
+  (cd "$FFMPEG_SRC" && nice -n 19 ionice -c3 ./configure \
+    --prefix="$CODEC_PREFIX" --libdir="$CODEC_PREFIX/lib" --pkgconfigdir="$CODEC_PREFIX/lib/pkgconfig" \
+    --disable-gpl --disable-nonfree --disable-programs --disable-doc --disable-everything \
+    --disable-avdevice --disable-avfilter --disable-swscale --disable-swresample --disable-postproc \
+    --enable-shared --disable-static --enable-avcodec --enable-avformat --enable-avutil \
+    --enable-decoder=libdav1d --enable-parser=av1 --enable-demuxer=matroska --enable-protocol=file \
+    --enable-libdav1d --extra-cflags="-I$CODEC_PREFIX/include" \
+    --extra-ldflags="-L$CODEC_PREFIX/lib")
+  require_root_space
+  nice -n 19 ionice -c3 make -C "$FFMPEG_SRC" -j "$JOBS"
+  nice -n 19 ionice -c3 make -C "$FFMPEG_SRC" install
+  touch "$FFMPEG_CONFIG_STAMP"
+fi
 PYTHON_TARBALL="$OUT/tmp/Python-$PYTHON_VERSION.tgz"
 PYTHON_SOURCE="$OUT/tmp/Python-$PYTHON_VERSION"
 if [[ ! -x "$PKG/python/bin/python3.12" ]]; then
   curl -fL --retry 3 "https://www.python.org/ftp/python/$PYTHON_VERSION/Python-$PYTHON_VERSION.tgz" -o "$PYTHON_TARBALL"
   tar -xzf "$PYTHON_TARBALL" -C "$OUT/tmp"
+  require_root_space
   (cd "$PYTHON_SOURCE" && \
     CFLAGS="-O2 -ffile-prefix-map=$PYTHON_SOURCE=." \
     LDFLAGS='-Wl,-rpath,$ORIGIN/../lib' \
@@ -43,27 +118,41 @@ export DOTNET_ROOT=/opt/dotnet DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1
 export NXNATIVE="$ROOT/nxnative" NXL_TOOLCHAINS="$OUT/toolchains" NXS2_BIN="$PKG/builder/bin"
 export NXS2_ZBIC_UNPACK="$PKG/builder/bin/zbic-unpack" NXS2_JOBS="$JOBS" PYTHONDONTWRITEBYTECODE=1 PYTHONUTF8=1
 export NXS2_RELEASE_PACKAGE=1
-export NXS2_CMAKE_ARGS="-DNXRT_ENABLE_FFMPEG=OFF"
+export NXS2_CMAKE_ARGS="-DNXRT_ENABLE_FFMPEG=ON"
 
 cd "$ROOT"
+require_root_space
 nice -n 19 ionice -c3 "$PYTHON" nxs2.py setup 2>&1 | tee "$OUT/setup.log"
 BUILD="$ROOT/windows/build/linux-0400486024DEC000"
+require_root_space
 nice -n 19 ionice -c3 cmake --build "$BUILD" -j "$JOBS" 2>&1 | tee "$OUT/ctest-build.log"
 export LD_LIBRARY_PATH="$NXL_TOOLCHAINS/llvm-23.1.4/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+require_root_space
 nice -n 19 ionice -c3 ctest --test-dir "$BUILD" --output-on-failure --parallel "$JOBS" 2>&1 | tee "$OUT/ctest.log"
 
 LLVM="$OUT/toolchains/llvm-23.1.4"
 SDL="$OUT/toolchains/SDL3-3.4.18"
-for name in nxanalyze nxlift nxrt zbic-unpack; do
+for name in nxanalyze nxlift nxrt nxrt-movie-decode zbic-unpack; do
   install -m 0755 "$BUILD/bin/$name" "$PKG/builder/bin/$name"
 done
 install -m 0755 "$LLVM/bin/ld.lld" "$PKG/builder/bin/ld.lld"
 install -m 0755 "$(command -v spirv-opt)" "$PKG/builder/bin/spirv-opt"
 install -m 0755 "$(command -v spirv-val)" "$PKG/builder/bin/spirv-val"
 install -m 0644 "$BUILD/bin/libSDL3.so.0" "$PKG/builder/lib/libSDL3.so.0"
+install -m 0644 "$CODEC_PREFIX"/lib/libdav1d.so.* "$PKG/builder/lib/"
+install -m 0644 "$CODEC_PREFIX"/lib/libavutil.so.* "$PKG/builder/lib/"
+install -m 0644 "$CODEC_PREFIX"/lib/libavcodec.so.* "$PKG/builder/lib/"
+install -m 0644 "$CODEC_PREFIX"/lib/libavformat.so.* "$PKG/builder/lib/"
+for codec_lib in "$PKG"/builder/lib/libdav1d.so.* "$PKG"/builder/lib/libavutil.so.* "$PKG"/builder/lib/libavcodec.so.* "$PKG"/builder/lib/libavformat.so.*; do
+  patchelf --set-rpath '$ORIGIN' "$codec_lib"
+done
+patchelf --set-rpath '$ORIGIN/../lib' "$PKG/builder/bin/nxrt-movie-decode"
 install -m 0755 "$ROOT/ampere-lower/ampere-lower" "$PKG/builder/ampere-lower/ampere-lower"
 patchelf --set-rpath '$ORIGIN/../lib' "$PKG/builder/bin/nxrt"
+install -D -m 0644 "$FFMPEG_SRC/COPYING.LGPLv2.1" "$PKG/LICENSES/FFmpeg-LGPL-2.1.txt"
+install -D -m 0644 "$DAV1D_SRC/COPYING" "$PKG/LICENSES/dav1d-BSD-2-Clause.txt"
 
+require_root_space
 "$PYTHON" -m unittest discover -s tests -v 2>&1 | tee "$OUT/python-tests.log"
 "$PYTHON" -m unittest discover -s tools/tests -v 2>&1 | tee "$OUT/tool-tests.log"
 "$PYTHON" - <<'PY'
@@ -128,6 +217,8 @@ PY
 install -D -m 0644 "$ROOT/release/README-RELEASE.md" "$PKG/README-RELEASE.md"
 install -D -m 0644 "$ROOT/README.md" "$PKG/README.md"
 install -D -m 0644 "$ROOT/release/THIRD-PARTY-NOTICES.md" "$PKG/THIRD-PARTY-NOTICES.md"
+install -D -m 0644 "$ROOT/release/THIRD-PARTY-SOURCE.md" "$PKG/THIRD-PARTY-SOURCE.md"
+install -D -m 0644 "$ROOT/TESTER-v0.1.3.md" "$PKG/TESTER-v0.1.3.md"
 install -D -m 0644 /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf "$PKG/fonts/DejaVuSans.ttf"
 install -D -m 0644 /usr/share/doc/fonts-dejavu-core/copyright "$PKG/LICENSES/DejaVu-font-license.txt"
 

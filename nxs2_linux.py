@@ -24,7 +24,7 @@ def build_dir(n):
 def build_jobs(default=None):
     try: requested = int(os.environ.get('NXS2_JOBS') or 0)
     except ValueError: requested = 0
-    return max(1, min(10, requested or default or max(2, (os.cpu_count() or 4) // 2)))
+    return max(1, min(12, requested or default or max(2, (os.cpu_count() or 4) // 2)))
 
 
 def tools(n):

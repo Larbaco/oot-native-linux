@@ -15,6 +15,17 @@ NXRT="$BUILDER/bin/nxrt"
 REFERENCE_NXRT="$OOT_REFERENCE_PACKAGE/builder/bin/nxrt"
 STATE=/tmp/oot-native-smoke/state
 
+require_root_space() {
+  local root=${OOT_HOST_ROOT:-/host-root} available_kb
+  [[ -d "$root" ]] || root=/
+  available_kb=$(df -Pk "$root" | awk 'NR==2 {print $4}')
+  df -h "$root"
+  if [[ ! "$available_kb" =~ ^[0-9]+$ ]] || (( available_kb < 12582912 )); then
+    echo 'FAIL: host / must retain at least 12 GiB free' >&2
+    exit 2
+  fi
+}
+
 (
   cd "$PKG"
   sha256sum -c SHA256SUMS > /tmp/oot-native-smoke/state/package-checksums.log
@@ -37,6 +48,42 @@ if ! strings "$NXRT" | grep -F '[vk] ' >/dev/null; then
 fi
 echo 'PASS: nxrt contains libvulkan.so.1 and internal [vk] backend strings'
 
+movie_ldd=$(ldd "$NXRT" 2>&1) || { printf '%s\n' "$movie_ldd" >&2; exit 1; }
+printf '%s\n' "$movie_ldd" > "$STATE/nxrt-movie-ldd.log"
+for soname in libavcodec libdav1d; do
+  resolved=$(awk -v soname="$soname" '$1 ~ ("^" soname "\\.so") && $2 == "=>" {print $3; exit}' <<<"$movie_ldd")
+  package_lib_dir=$(realpath -e "$BUILDER/lib")
+  resolved_real=$(realpath -e "$resolved" 2>/dev/null || true)
+  case "$resolved_real" in
+    "$package_lib_dir"/*) ;;
+    *)
+    printf 'FAIL: %s did not resolve from the package:\n%s\n' "$soname" "$movie_ldd" >&2; exit 1
+    ;;
+  esac
+done
+echo 'PASS: nxrt resolves libavcodec and libdav1d from the package'
+
+capacity_output=$("$NXRT" --gfx null --log "$STATE/movie-capacity-log" 2>&1 || true)
+if ! grep -Fq 'movie AV1 decoder: built-in FFmpeg/libdav1d available' <<<"$capacity_output" || \
+   ! grep -Fq 'no ExeFS folder given' <<<"$capacity_output"; then
+  printf 'FAIL: nxrt did not report packaged AV1 decoder capability without ExeFS:\n%s\n' "$capacity_output" >&2
+  exit 1
+fi
+echo 'PASS: nxrt reports built-in AV1 decoder capability without loading ExeFS'
+
+# Generate a tiny synthetic AV1 WebM in the clean smoke container; this contains
+# no game footage or data and exercises the same decoder path as the runtime.
+require_root_space
+ffmpeg -hide_banner -loglevel error -f lavfi -i 'color=c=blue:s=32x32:r=2:d=1' \
+  -frames:v 2 -an -c:v libaom-av1 -cpu-used 8 -crf 45 -b:v 0 -y "$STATE/synthetic-av1.webm"
+mkdir -p "$STATE/synthetic-frames"
+movie_output=$("$BUILDER/bin/nxrt-movie-decode" "$STATE/synthetic-av1.webm" "$STATE/synthetic-frames" 1 1 2>&1)
+if ! grep -Fq 'end of stream seen: 1' <<<"$movie_output" || \
+   ! compgen -G "$STATE/synthetic-frames/frame_*.ppm" >/dev/null; then
+  printf 'FAIL: synthetic AV1 decode did not produce a frame and EOS:\n%s\n' "$movie_output" >&2; exit 1
+fi
+echo 'PASS: packaged nxrt-movie-decode decoded synthetic AV1 and observed EOS'
+
 nxrt_backend_gate() {
   local label=$1 exe=$2 log_dir=$3 output rc
   set +e
@@ -56,7 +103,7 @@ nxrt_backend_gate() {
 
 # No ExeFS argument is supplied: nxrt initializes only its host logger/address
 # space and reports backend selection. The reference is the released v0.1.0.
-nxrt_backend_gate 'v0.1.2' "$NXRT" "$STATE/v012-log"
+nxrt_backend_gate 'v0.1.3' "$NXRT" "$STATE/v013-log"
 nxrt_backend_gate 'v0.1.0-reference' "$REFERENCE_NXRT" "$STATE/v010-log"
 
 ldd_output=$(ldd "$NXRT" 2>&1) || { printf '%s\n' "$ldd_output" >&2; exit 1; }

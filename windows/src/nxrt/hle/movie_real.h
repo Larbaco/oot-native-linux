@@ -1,5 +1,5 @@
-// Real video decoding for the nn::movie stand-ins (hle_nv.c). AV1 through libavcodec (libdav1d), linked dynamically and only when pkg-config finds it
-// (NXRT_HAVE_FFMPEG); without it mvr_create() returns NULL and the stand-in decoder stays in charge. The decoder runs on its own thread so the game's threads never wait on it.
+// Real video decoding for the nn::movie stand-ins (hle_nv.c). AV1 through libavcodec (libdav1d), linked dynamically only when pkg-config finds it
+// (NXRT_HAVE_FFMPEG); without it mvr_create() returns NULL and the timed stand-in stays in charge. The decoder runs on its own thread so the game's threads never wait on it.
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
@@ -12,7 +12,8 @@ void mvr_pic_free(mvr_pic *p);
 
 // Debug: BT.709 limited-range NV12 -> RGB PPM (what the game's shader makes of the buffer). Used by the harness and by NXRT_MOVIE_DUMP.
 int mvr_write_ppm(const char *path, const uint8_t *nv12, int w, int h);
-int mvr_available(void);   // 1 when built with FFmpeg and NXRT_MOVIE_DECODE=1
+int mvr_available(void);   // 1 when built with FFmpeg and not disabled by NXRT_MOVIE_DECODE=0
+int mvr_build_available(void); // 1 when FFmpeg support is linked into nxrt
 // cfg/cfgsz: the track configuration (av1C). on_input is called from the worker thread when it takes a packet (the input queue has room), on_output when a
 // picture is ready. Both may be NULL. Returns NULL when decoding is off or unavailable.
 mvr *mvr_create(const void *cfg, size_t cfgsz, void (*on_input)(void *), void (*on_output)(void *), void *user);

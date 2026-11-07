@@ -100,7 +100,18 @@ static void movie_fill_audio(void *f, const movie_in *in) {
 static int movie_pump(movie_dec *d) {
     int any = 0;
     static int speed; if (!speed) { const char *e = getenv("NXRT_MOVIE_SPEED"); speed = e ? atoi(e) : 1; if (speed < 1) speed = 1; }
-    while (d->nin > 0 && d->nout < MOVIE_MAXF) {
+    while (d->nin > 0) {
+        // The game can retain every registered video frame while it drains
+        // its presentation queue. If EOS is next and that queue already has
+        // frames, attach EOS to the last queued frame instead of requiring an
+        // additional free frame that may never be returned before the wait.
+        if (!d->audio && d->nin == 1 && (d->in[0].flags & 8) && d->nfre == 0 && d->nout > 0) {
+            *(uint8_t *)((uint8_t *)d->out[d->nout - 1] + 0x88) = 1;
+            d->nin = 0; d->n_eos++; any |= 2;
+            LOG("[movie] video decoder %p: end of stream attached to final queued frame", d->self);
+            break;
+        }
+        if (d->nout >= MOVIE_MAXF) break;
         if (!d->audio && speed > 1 && !(d->in[0].flags & 8) && (d->n_in++ % (uint64_t)speed) != 0) {   // fast-forward: the input is consumed, no frame comes out of it
             memmove(d->in, d->in + 1, (size_t)--d->nin * sizeof(movie_in)); any |= 2; continue; }
         if (d->nfre <= 0) break;
@@ -138,7 +149,8 @@ static int movie_pump_real(movie_dec *d) {
     return any;
 }
 static int movie_init(void *self, int audio) {
-    static _Atomic int once[2]; if (!atomic_exchange(&once[audio], 1)) LOG("[RED] movie::%sDecoder: no hardware decoder on the host; stand-in decoder (no pixels, no sound, timing and end of stream only)", audio ? "Audio" : "Video");
+    static _Atomic int once[2];
+    if (audio && !atomic_exchange(&once[audio], 1)) LOG("[movie] audio decoder: timed stand-in initialized (silence)");
     pthread_mutex_lock(&g_mv_mu);
     movie_dec *d = movie_get(self, audio, 1); mvr *old = d->r; d->r = NULL; d->started = 0; d->nfre = d->nout = d->nin = 0;
     for (int k = 0; k < 3; k++) movie_ev(d, k);
@@ -254,7 +266,12 @@ HLE_FORCE("_ZN5movie12VideoDecoder9ConfigureEPKN2nn5movie13MediaPropertyEPKvm", 
     (void)p;   // the track configuration (av1C) is what the real decoder needs; the dimensions come out of the stream
     pthread_mutex_lock(&g_mv_mu); movie_dec *d = movie_get(self, 0, 0); mvr *old = d ? d->r : NULL; if (d) d->r = NULL; pthread_mutex_unlock(&g_mv_mu);
     if (old) mvr_destroy(old);
-    if (d && mvr_available()) { mvr *r = mvr_create(c, n, movie_real_on_in, movie_real_on_out, d); pthread_mutex_lock(&g_mv_mu); d->r = r; pthread_mutex_unlock(&g_mv_mu); if (r) LOG("[movie] video decoder %p: real AV1 decoding (NXRT_MOVIE_DECODE)", self); }
+    if (d && mvr_available()) { mvr *r = mvr_create(c, n, movie_real_on_in, movie_real_on_out, d); pthread_mutex_lock(&g_mv_mu); d->r = r; pthread_mutex_unlock(&g_mv_mu); if (r) LOG("[movie] video decoder %p: real AV1 decoding available", self); else LOG("[movie] real AV1 decoder unavailable; using timed no-image stand-in"); }
+    else if (d) {
+        const char *setting = getenv("NXRT_MOVIE_DECODE");
+        if (setting && *setting == '0') LOG("[movie] NXRT_MOVIE_DECODE=0; using timed no-image stand-in");
+        else if (!mvr_build_available()) LOG("[movie] FFmpeg/libdav1d support was not built; using timed no-image stand-in");
+    }
     return 0;
 }
 HLE_FORCE("_ZN5movie12AudioDecoder9ConfigureEPKN2nn5movie13MediaPropertyEPKvm", MV, int, h_mv_acfg, void *self, void *p, void *c, uint64_t n) { (void)self; (void)p; (void)c; (void)n; return 0; }

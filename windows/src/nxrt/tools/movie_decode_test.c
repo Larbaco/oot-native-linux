@@ -26,7 +26,7 @@ int main(int argc, char **argv) {
     AVPacket *pk = av_packet_alloc(); AVRational ns = {1, 1000000000};
     int got = 0, eos = 0, sent = 0, done_in = 0; double t0 = now(); int64_t prev = -1, out_of_order = 0;
     mvr_pic p;
-    while (!eos && got < N * step) {
+    while (!eos && got < 6000 && now() - t0 < 30.0) {
         if (!done_in && mvr_room(r) > 0) {
             if (av_read_frame(fc, pk) < 0) { mvr_submit(r, NULL, 0, 0, 1); done_in = 1; }
             else { if (pk->stream_index == vs) { mvr_submit(r, pk->data, (size_t)pk->size, av_rescale_q(pk->pts, fc->streams[vs]->time_base, ns), 0); sent++; } av_packet_unref(pk); }
@@ -44,5 +44,5 @@ int main(int argc, char **argv) {
     double dt = now() - t0;
     printf("%d packets sent, %d pictures in %.2f s (%.1f fps), timestamps out of order: %lld, end of stream seen: %d\n", sent, got, dt, got / dt, (long long)out_of_order, eos);
     mvr_destroy(r); av_packet_free(&pk); avformat_close_input(&fc);
-    return 0;
+    return eos && got > 0 ? 0 : 1;
 }

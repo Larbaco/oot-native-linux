@@ -1,11 +1,6 @@
-FROM ubuntu:22.04
+# Extend the existing clean Ubuntu 22.04 smoke image locally; FFmpeg here is
+# only the free synthetic AV1 encoder used by package-smoke.sh.
+FROM oot-native-package-smoke:ubuntu22.04
 ARG DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    binutils build-essential ca-certificates libasound2 libbsd0 libbz2-1.0 libexpat1 \
-    libfontconfig1 libfreetype6 liblzma5 libmd0 libpng16-16 \
-    libpulse0 libssl3 libuuid1 libvulkan1 libwayland-client0 libx11-6 \
-    libxau6 libxcb1 libxcomposite1 libxcursor1 libxdamage1 libxdmcp6 \
-    libxext6 libxfixes3 libxi6 libxkbcommon0 libxrandr2 libxrender1 \
-    libxss1 libxtst6 libvulkan-dev mesa-vulkan-drivers zlib1g fonts-dejavu-core xvfb x11-utils \
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
-WORKDIR /tmp/oot-native-smoke

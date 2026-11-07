@@ -94,7 +94,8 @@ HLE_FORCE("_ZN2nn2vi39SetLayerNextHdrToSdrToneMappingMetadataEPNS0_5LayerENS0_14
 HLE_FORCE("_ZN2nn2vi24QueryDisplayVrrSupportedEPbPKNS0_7DisplayE", "SWITCH2: the host display is not queried for VRR: not supported", Result, h_vi_QVrr, uint8_t *out, const void *disp) { (void)disp; if (out) *out = 0; return 0; }
 // The game (agl HDR pipeline: HdrColorMappingParam / hdr_color_mapping_compose / HdrEnable) asks the display whether it is in HDR and renders in nits when it is. The host presents SDR,
 // so both queries say so: not HDR, output format 0 (SDR), and a standard-dynamic-range paper white. NXRT_HDR_STATUS=<isHdr>,<format>,<luminance> and NXRT_HDR_PAPER=<nits>
-// override the answers (experiments); every call is logged
+// override the answers (experiments); the first few calls are logged by default, then a summary every 600 calls.
+// NXRT_LOG_VERBOSE=1 restores per-call logging for HLE diagnosis.
 static long hdr_env(const char *name, int idx, long def) {
     const char *e = getenv(name); if (!e) return def;
     for (int i = 0; i < idx; i++) { e = strchr(e, ','); if (!e) return def; e++; }
@@ -103,7 +104,12 @@ static long hdr_env(const char *name, int idx, long def) {
 HLE_FORCE("_ZN2nn2vi21QueryDisplayHdrStatusEPbPNS0_15HdrOutputFormatEPtPKNS0_7DisplayE", "SWITCH2: HDR status of the display; the host presents SDR: not HDR, SDR format",
           Result, h_vi_QHdrStatus, uint8_t *is_hdr, int *fmt, uint16_t *lum, const void *disp) {
     uint8_t h = (uint8_t)hdr_env("NXRT_HDR_STATUS", 0, 0); int f = (int)hdr_env("NXRT_HDR_STATUS", 1, 0); uint16_t l = (uint16_t)hdr_env("NXRT_HDR_STATUS", 2, 0);
-    LOG("vi::QueryDisplayHdrStatus(disp=%p) -> isHdr=%u format=%d luminance=%u", disp, h, f, l);
+    static _Atomic unsigned long long calls;
+    static int verbose = -1;
+    if (verbose < 0) { const char *e = getenv("NXRT_LOG_VERBOSE"); verbose = e && *e && *e != '0'; }
+    unsigned long long n = atomic_fetch_add(&calls, 1) + 1;
+    if (verbose || n <= 3) LOG("vi::QueryDisplayHdrStatus(disp=%p) -> isHdr=%u format=%d luminance=%u", disp, h, f, l);
+    else if (n % 600 == 0) LOG("vi::QueryDisplayHdrStatus repeated %llu times (last: isHdr=%u format=%d luminance=%u)", n, h, f, l);
     if (is_hdr) *is_hdr = h; if (fmt) *fmt = f; if (lum) *lum = l; return 0;
 }
 HLE_FORCE("_ZN2nn2vi25QueryDisplayHdrPaperWhiteEPtPKNS0_7DisplayE", "SWITCH2: HDR paper white of the display (nits); the host presents SDR", Result, h_vi_QPaper, uint16_t *out, const void *disp) {

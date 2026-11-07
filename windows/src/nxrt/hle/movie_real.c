@@ -31,6 +31,7 @@ void mvr_pic_free(mvr_pic *p) { if (p) { free(p->nv12); p->nv12 = NULL; } }
 
 #ifndef NXRT_HAVE_FFMPEG
 int mvr_available(void) { return 0; }
+int mvr_build_available(void) { return 0; }
 mvr *mvr_create(const void *c, size_t n, void (*i)(void *), void (*o)(void *), void *u) { (void)c; (void)n; (void)i; (void)o; (void)u; return NULL; }
 int mvr_submit(mvr *r, const uint8_t *d, size_t n, int64_t t, int e) { (void)r; (void)d; (void)n; (void)t; (void)e; return 0; }
 int mvr_room(mvr *r) { (void)r; return 0; }
@@ -54,7 +55,8 @@ struct mvr {
     void (*on_in)(void *), (*on_out)(void *); void *user;
 };
 
-int mvr_available(void) { const char *e = getenv("NXRT_MOVIE_DECODE"); return e && *e && *e != '0'; }
+int mvr_available(void) { const char *e = getenv("NXRT_MOVIE_DECODE"); return !(e && *e == '0'); }
+int mvr_build_available(void) { return 1; }
 
 // Planar/semi-planar 8-bit (and 10-bit, truncated) 4:2:0 -> packed NV12. Unknown formats come out black rather than failing the movie.
 static int to_nv12(const AVFrame *f, mvr_pic *p) {

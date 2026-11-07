@@ -31,7 +31,13 @@ corresponding-source archive.
   complete upstream license and exception are in
   `LICENSES/LLVM-Apache-2.0-with-LLVM-exception.txt`.
 - SDL3 3.4.18 is zlib-licensed and included as `builder/lib/libSDL3.so.0`.
-  FFmpeg is neither linked nor included.
+- FFmpeg 7.1.1 (`libavcodec`, `libavformat`, `libavutil`) is configured without
+  GPL and nonfree components, with only AV1 decode and WebM demux support.
+  It is LGPL-2.1; full text is in `LICENSES/FFmpeg-LGPL-2.1.txt`.
+- dav1d 1.5.1 is BSD-2-Clause; full text is in
+  `LICENSES/dav1d-BSD-2-Clause.txt`.
+- Exact source tarballs for both codec libraries are provided in the adjacent
+  `*-thirdparty-source.tar.xz` archive.
 - SPIRV-Tools is Apache-2.0. `spirv-opt` and `spirv-val` are included.
 - SPIRV-Tools package copyright and any installed NOTICE are included in
   `LICENSES/`. `Spv.Generator` from Ryujinx is MIT; its original text is also

@@ -2,6 +2,7 @@
    the GPU (none until the Vulkan renderer), the CPU and its x86-64-v3 support, the Windows build, the game's build ID and the reserved ranges. */
 #include "dm.h"
 #include "nxrt/runtime.h"
+#include "movie_real.h"
 
 #ifdef _WIN32
 #include <direct.h>
@@ -60,6 +61,7 @@ void nxrt_log_banner(void) {
     plat_cpu_brand(cpu, sizeof cpu); plat_os_version(win, sizeof win);
     LOG("nxrt v0 (runtime ABI %d, built %s %s), log %s", NXW_ABI_VERSION, __DATE__, __TIME__, g_log_path);
     LOG("GPU: the graphics backend's choice (--gfx vulkan: the [vk] lines below name the GPU and driver; --gfx null: none)");
+    LOG("movie AV1 decoder: %s", mvr_build_available() ? "built-in FFmpeg/libdav1d available (default; NXRT_MOVIE_DECODE=0 disables)" : "not built; timed no-image stand-in will be used");
     LOG("CPU: %s, %u logical processors, %.1f GB RAM, x86-64-v3 (AVX2+FMA3) %s", cpu, plat_cpu_count(), plat_ram_bytes() / 1073741824.0,
         plat_cpu_x86_64_v3() ? "yes" : "NO: below the minimum CPU (DESIGN §9.1)");
     LOG("OS: %s", win);

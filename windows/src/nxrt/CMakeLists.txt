@@ -16,7 +16,7 @@ else()
   set(NXRT_PLATFORM plat/plat_linux.c host/addrspace_linux.c host/prof_linux.c)
   set(NXRT_SYS_LIBS ${CMAKE_DL_LIBS} pthread m)
 endif()
-# Real movie decoding (hle/movie_real.c): libavcodec (libdav1d inside) linked dynamically when pkg-config finds it; runtime switch NXRT_MOVIE_DECODE=1
+# Real movie decoding (hle/movie_real.c): libavcodec (libdav1d inside) linked dynamically when pkg-config finds it; enabled by default, NXRT_MOVIE_DECODE=0 opts out.
 option(NXRT_ENABLE_FFMPEG "Build optional FFmpeg movie decoding" ON)
 find_package(PkgConfig QUIET)
 if(NXRT_ENABLE_FFMPEG AND PkgConfig_FOUND AND NOT WIN32)
