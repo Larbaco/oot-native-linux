@@ -1,0 +1,23 @@
+#version 450
+// Stand-in for the last dispatch of OoT's NDSR chain (agl_ndsr_vr.pck, e5addddb...), the neural upscaler the shader lowering cannot run well enough: the
+// scene colour (binding 0, any float-sampled format: E5B9G9R9 or R11G11B10F) scaled to the whole output image (binding 1, written without a format so
+// R11G11B10F, RGBA8, RGBA16F all take it) with bilinear filtering, as Eglantine's UpscaleInsteadOfNativeProgram blit does. No temporal or sharpening work
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(set = 0, binding = 1) uniform writeonly image2D dst;
+
+vec4 bilinear(sampler2D t, vec2 uv) {   // texelFetch with edge clamping: the game's sampler is not the point (and a shared-exponent format needs no filter support)
+    ivec2 sz = textureSize(t, 0);
+    vec2 p = uv * vec2(sz) - 0.5;
+    ivec2 i0 = ivec2(floor(p)); vec2 f = p - vec2(i0);
+    ivec2 lo = clamp(i0, ivec2(0), sz - 1), hi = clamp(i0 + 1, ivec2(0), sz - 1);
+    vec4 a = mix(texelFetch(t, ivec2(lo.x, lo.y), 0), texelFetch(t, ivec2(hi.x, lo.y), 0), f.x);
+    vec4 b = mix(texelFetch(t, ivec2(lo.x, hi.y), 0), texelFetch(t, ivec2(hi.x, hi.y), 0), f.x);
+    return mix(a, b, f.y);
+}
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy), sz = imageSize(dst);
+    if (p.x >= sz.x || p.y >= sz.y) return;
+    vec2 uv = (vec2(p) + 0.5) / vec2(sz);
+    imageStore(dst, p, vec4(bilinear(src, uv).rgb, 1.0));
+}

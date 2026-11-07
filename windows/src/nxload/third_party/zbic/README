@@ -1,0 +1,2 @@
+zstd amalgamation with Nintendo's ZBIC entropy-table coding (ZSTD_ZBIC_SUPPORT=1), from kinnay/zbic (GPLv2).
+Used only for NSO segments with flags bit 7 set (SDK >= 22). Not a drop-in plain-zstd decoder.

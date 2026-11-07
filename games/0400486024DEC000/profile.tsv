@@ -1,0 +1,11 @@
+# Port-level keys of the profile (read by nxs2.py, nxs2_linux.py, tools/gen_game_profile.py, nxshader.py). game.tsv stays in nxnative's format.
+slug	oot
+window_title	Ocarina of Time
+default_version	2.0.0
+# [GUESS] suffix of the shader package files tools/s2_pkg.py writes
+pkg_suffix	oot
+# [GUESS] depth-range convention unchecked; none for now
+shader_variants
+build_macro	v131072	200
+# NVN API version reported by nvnDeviceGetInteger: the OoT main (0x346c108) requires major == 231 and minor >= 40 (NVN2); without it no device is created
+nvn_api	231.40

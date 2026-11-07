@@ -1,0 +1,915 @@
+# A64 encodings: ARMv8.0-8.5 base, FP, AdvSIMD, crypto (AES, SHA1, SHA256), CRC32, LSE, RCpc, PAC, BTI; SVE, SME, MTE and FP16
+# arithmetic are left unallocated. Grammar: see gen_a64.py. First match in table order wins.
+# Encodings follow the Arm Architecture Reference Manual (DDI 0487) encoding index; decode boundaries (which reserved values are
+# rejected, which should-be bits are ignored) and spelling follow LLVM 23's disassembler with +v8.5a,+crypto, the cross-check
+# reference. A few later encodings that LLVM decodes with any feature set are included so undecodable words agree (tagged
+# @sme, @ebep, @rprfm and @sysreg128; @llvm marks op0 = 0 system space that only LLVM decodes, as MSR/MRS S0_*).
+# Printer helpers (print_impl.hpp): r/rsp/w/x/wsp/xsp general registers; imm/uimm (hex), dec (decimal), fimm, hex016 immediates;
+# target/page addresses; shift/aimm/ext/memext/off/offz operand parts; va/vt/vs/ve/vl/vlt/vll SIMD&FP registers; s/txt/name for
+# computed or table-driven text (names.tbl); sysreg/sysreg128/sysop for system operands.
+
+# ---------------------------------------------------------------- reserved
+UDF          0000000000000000 imm16:16 | udf {imm imm16}
+
+# ---------------------------------------------------------------- data processing: immediate
+ADR          0 immlo:2 10000 immhi:19 Rd:5 | adr {x Rd}, {target sext(immhi << 2|immlo, 21)}
+ADRP         1 immlo:2 10000 immhi:19 Rd:5 | adrp {x Rd}, {page sext(immhi << 2|immlo, 21) * 4096}
+
+ADD_imm      sf 0 0 100010 sh imm12:12 Rn:5 Rd:5 | add {rsp sf, Rd}, {rsp sf, Rn}, {aimm imm12, sh}
+= sh == 0 && imm12 == 0 && (Rd == 31 || Rn == 31) | mov {rsp sf, Rd}, {rsp sf, Rn}
+ADDS_imm     sf 0 1 100010 sh imm12:12 Rn:5 Rd:5 | adds {r sf, Rd}, {rsp sf, Rn}, {aimm imm12, sh}
+= Rd == 31 | cmn {rsp sf, Rn}, {aimm imm12, sh}
+SUB_imm      sf 1 0 100010 sh imm12:12 Rn:5 Rd:5 | sub {rsp sf, Rd}, {rsp sf, Rn}, {aimm imm12, sh}
+SUBS_imm     sf 1 1 100010 sh imm12:12 Rn:5 Rd:5 | subs {r sf, Rd}, {rsp sf, Rn}, {aimm imm12, sh}
+= Rd == 31 | cmp {rsp sf, Rn}, {aimm imm12, sh}
+
+AND_imm      sf 00 100100 N immr:6 imms:6 Rn:5 Rd:5 ? logimm_ok(sf, N, immr, imms) | and {rsp sf, Rd}, {r sf, Rn}, {uimm bitmask(N, immr, imms, 32 << sf)}
+ORR_imm      sf 01 100100 N immr:6 imms:6 Rn:5 Rd:5 ? logimm_ok(sf, N, immr, imms) | orr {rsp sf, Rd}, {r sf, Rn}, {uimm bitmask(N, immr, imms, 32 << sf)}
+= Rn == 31 && !any_movw(bitmask(N, immr, imms, 32 << sf), 32 << sf) | mov {rsp sf, Rd}, {imm sext(bitmask(N, immr, imms, 32 << sf), 32 << sf)}
+EOR_imm      sf 10 100100 N immr:6 imms:6 Rn:5 Rd:5 ? logimm_ok(sf, N, immr, imms) | eor {rsp sf, Rd}, {r sf, Rn}, {uimm bitmask(N, immr, imms, 32 << sf)}
+ANDS_imm     sf 11 100100 N immr:6 imms:6 Rn:5 Rd:5 ? logimm_ok(sf, N, immr, imms) | ands {r sf, Rd}, {r sf, Rn}, {uimm bitmask(N, immr, imms, 32 << sf)}
+= Rd == 31 | tst {r sf, Rn}, {uimm bitmask(N, immr, imms, 32 << sf)}
+
+MOVN         sf 00 100101 hw:2 imm16:16 Rd:5 !sf=0,hw=1x | movn {r sf, Rd}, {imm imm16}{shift 0, hw * 16}
+= movn_alias(sf, imm16, hw) | mov {r sf, Rd}, {imm sext(~(uint64_t(imm16) << (hw * 16)), 32 << sf)}
+MOVZ         sf 10 100101 hw:2 imm16:16 Rd:5 !sf=0,hw=1x | movz {r sf, Rd}, {imm imm16}{shift 0, hw * 16}
+= imm16 != 0 || hw == 0 | mov {r sf, Rd}, {imm sext(uint64_t(imm16) << (hw * 16), 32 << sf)}
+MOVK         sf 11 100101 hw:2 imm16:16 Rd:5 !sf=0,hw=1x | movk {r sf, Rd}, {imm imm16}{shift 0, hw * 16}
+
+SBFM         sf 00 100110 N immr:6 imms:6 Rn:5 Rd:5 !sf=0,N=1 !sf=1,N=0 !sf=0,immr=1xxxxx !sf=0,imms=1xxxxx | sbfx {r sf, Rd}, {r sf, Rn}, {dec immr}, {dec imms - immr + 1}
+= immr == 0 && imms == 7 | sxtb {r sf, Rd}, {w Rn}
+= immr == 0 && imms == 15 | sxth {r sf, Rd}, {w Rn}
+= immr == 0 && imms == 31 && sf | sxtw {x Rd}, {w Rn}
+= imms == (sf ? 63u : 31u) | asr {r sf, Rd}, {r sf, Rn}, {dec immr}
+= immr > imms | sbfiz {r sf, Rd}, {r sf, Rn}, {dec (32 << sf) - immr}, {dec imms + 1}
+BFM          sf 01 100110 N immr:6 imms:6 Rn:5 Rd:5 !sf=0,N=1 !sf=1,N=0 !sf=0,immr=1xxxxx !sf=0,imms=1xxxxx | bfxil {r sf, Rd}, {r sf, Rn}, {dec immr}, {dec imms - immr + 1}
+= Rn == 31 && (immr == 0 || imms < immr) | bfc {r sf, Rd}, {dec ((32 << sf) - immr) % (32 << sf)}, {dec imms + 1}
+= imms < immr | bfi {r sf, Rd}, {r sf, Rn}, {dec ((32 << sf) - immr) % (32 << sf)}, {dec imms + 1}
+UBFM         sf 10 100110 N immr:6 imms:6 Rn:5 Rd:5 !sf=0,N=1 !sf=1,N=0 !sf=0,immr=1xxxxx !sf=0,imms=1xxxxx | ubfx {r sf, Rd}, {r sf, Rn}, {dec immr}, {dec imms - immr + 1}
+= immr == 0 && imms == 7 && !sf | uxtb {w Rd}, {w Rn}
+= immr == 0 && imms == 15 && !sf | uxth {w Rd}, {w Rn}
+= imms != (sf ? 63u : 31u) && imms + 1 == immr | lsl {r sf, Rd}, {r sf, Rn}, {dec (sf ? 63 : 31) - imms}
+= imms == (sf ? 63u : 31u) | lsr {r sf, Rd}, {r sf, Rn}, {dec immr}
+= immr > imms | ubfiz {r sf, Rd}, {r sf, Rn}, {dec (32 << sf) - immr}, {dec imms + 1}
+
+EXTR         sf 00 100111 N 0 Rm:5 imms:6 Rn:5 Rd:5 !sf=0,N=1 !sf=1,N=0 !sf=0,imms=1xxxxx | extr {r sf, Rd}, {r sf, Rn}, {r sf, Rm}, {imm imms}
+= Rn == Rm | ror {r sf, Rd}, {r sf, Rn}, {imm imms}
+
+# ---------------------------------------------------------------- branches, exception generation, system
+B_cond       0101010 0 imm19:19 0 cond:4 | b.{cond cond} {target sext(imm19, 19) * 4}
+
+SVC          11010100 000 imm16:16 000 01 | svc {imm imm16}
+= imm16 == 0 | svc #0
+HVC          11010100 000 imm16:16 000 10 | hvc {imm imm16}
+= imm16 == 0 | hvc #0
+SMC          11010100 000 imm16:16 000 11 | smc {imm imm16}
+= imm16 == 0 | smc #0
+BRK          11010100 001 imm16:16 000 00 | brk {imm imm16}
+= imm16 == 0 | brk #0
+HLT          11010100 010 imm16:16 000 00 | hlt {imm imm16}
+= imm16 == 0 | hlt #0
+DCPS1        11010100 101 imm16:16 000 01 | dcps1 {imm imm16}
+= imm16 == 0 | dcps1
+DCPS2        11010100 101 imm16:16 000 10 | dcps2 {imm imm16}
+= imm16 == 0 | dcps2
+DCPS3        11010100 101 imm16:16 000 11 | dcps3 {imm imm16}
+= imm16 == 0 | dcps3
+
+HINT         1101010100 0 00 011 0010 CRm:4 op2:3 11111 | {name names_hint, CRm << 3|op2, "hint ", CRm << 3|op2}
+CLREX        1101010100 0 00 011 0011 CRm:4 010 11111 | clrex {imm CRm}
+= CRm == 15 | clrex
+DSB          1101010100 0 00 011 0011 CRm:4 100 11111 | {txt names_dsb, CRm}
+DMB          1101010100 0 00 011 0011 CRm:4 101 11111 | {txt names_dmb, CRm}
+ISB          1101010100 0 00 011 0011 CRm:4 110 11111 | {txt names_isb, CRm}
+SB           1101010100 0 00 011 0011 xxxx 111 11111 @sb | sb
+CFINV        1101010100 0 00 000 0100 xxxx 000 11111 @flagm | cfinv
+XAFLAG       1101010100 0 00 000 0100 xxxx 001 11111 @altnzcv | xaflag
+AXFLAG       1101010100 0 00 000 0100 xxxx 010 11111 @altnzcv | axflag
+SMSTART      1101010100 0 00 011 0100 0 opt:2 on 011 11111 !opt=00 @sme | {s on ? "smstart" : "smstop"}{s opt == 1 ? " sm" : opt == 2 ? " za" : ""}
+MSR_PM       1101010100 0 00 001 0100 001 imm 000 11111 @ebep | msr PM, {imm imm}
+MSR_imm      1101010100 0 00 op1:3 0100 CRm:4 op2:3 11111 ? lookup(names_pstate, op1 << 3|op2) | msr {txt names_pstate, op1 << 3|op2}, {imm CRm}
+SYS          1101010100 0 01 op1:3 CRn:4 CRm:4 op2:3 Rt:5 | {sysop op1, CRn, CRm, op2, Rt}
+SYSL         1101010100 1 01 op1:3 CRn:4 CRm:4 op2:3 Rt:5 | sysl {x Rt}, {imm op1}, c{num CRn}, c{num CRm}, {imm op2}
+MSR_reg      1101010100 0 1 o0 op1:3 CRn:4 CRm:4 op2:3 Rt:5 | msr {sysreg o0 << 14|op1 << 11|CRn << 7|CRm << 3|op2, false}, {x Rt}
+MRS          1101010100 1 1 o0 op1:3 CRn:4 CRm:4 op2:3 Rt:5 | mrs {x Rt}, {sysreg o0 << 14|op1 << 11|CRn << 7|CRm << 3|op2, true}
+# 128-bit system register moves and SYSP (Armv9.4; LLVM decodes them with any feature set). Register pairs start even.
+MSRR         1101010101 0 op0:2 op1:3 CRn:4 CRm:4 op2:3 Rt:5 !op0=01 !Rt=xxxx1 @sysreg128 | msrr {sysreg128 op0, op1 << 11|CRn << 7|CRm << 3|op2, false}, {x Rt}, {x Rt + 1}
+SYSP         1101010101 0 01 op1:3 CRn:4 CRm:4 op2:3 Rt:5 @sysreg128 ? !(Rt & 1) || Rt == 31 | sysp {imm op1}, c{num CRn}, c{num CRm}, {imm op2}{xpair_opt Rt}
+MRRS         1101010101 1 op0:2 op1:3 CRn:4 CRm:4 op2:3 Rt:5 !Rt=xxxx1 @sysreg128 | mrrs {x Rt}, {x Rt + 1}, {sysreg128 op0, op1 << 11|CRn << 7|CRm << 3|op2, true}
+# op0 = 0 outside the instructions above is unallocated; LLVM still decodes it as a register move with a S0_* name
+MSR_S0       1101010100 0 00 op1:3 CRn:4 CRm:4 op2:3 Rt:5 @llvm | msr {sysreg0 op1, CRn, CRm, op2}, {x Rt}
+MRS_S0       1101010100 1 00 op1:3 CRn:4 CRm:4 op2:3 Rt:5 @llvm | mrs {x Rt}, {sysreg0 op1, CRn, CRm, op2}
+
+BR           1101011 0000 11111 000000 Rn:5 00000 | br {x Rn}
+BLR          1101011 0001 11111 000000 Rn:5 00000 | blr {x Rn}
+RET          1101011 0010 11111 000000 Rn:5 00000 | ret {x Rn}
+= Rn == 30 | ret
+ERET         1101011 0100 11111 000000 11111 00000 | eret
+DRPS         1101011 0101 11111 000000 11111 00000 | drps
+BRAAZ        1101011 0000 11111 00001 M Rn:5 11111 @pauth | {s M ? "brabz" : "braaz"} {x Rn}
+BLRAAZ       1101011 0001 11111 00001 M Rn:5 11111 @pauth | {s M ? "blrabz" : "blraaz"} {x Rn}
+RETAA        1101011 0010 11111 00001 M 11111 11111 @pauth | {s M ? "retab" : "retaa"}
+ERETAA       1101011 0100 11111 00001 M 11111 11111 @pauth | {s M ? "eretab" : "eretaa"}
+BRAA         1101011 1000 11111 00001 M Rn:5 Rm:5 @pauth | {s M ? "brab" : "braa"} {x Rn}, {xsp Rm}
+BLRAA        1101011 1001 11111 00001 M Rn:5 Rm:5 @pauth | {s M ? "blrab" : "blraa"} {x Rn}, {xsp Rm}
+
+B            0 00101 imm26:26 | b {target sext(imm26, 26) * 4}
+BL           1 00101 imm26:26 | bl {target sext(imm26, 26) * 4}
+CBZ          sf 011010 0 imm19:19 Rt:5 | cbz {r sf, Rt}, {target sext(imm19, 19) * 4}
+CBNZ         sf 011010 1 imm19:19 Rt:5 | cbnz {r sf, Rt}, {target sext(imm19, 19) * 4}
+TBZ          b5 011011 0 b40:5 imm14:14 Rt:5 | tbz {r b5, Rt}, {imm b5 << 5|b40}, {target sext(imm14, 14) * 4}
+TBNZ         b5 011011 1 b40:5 imm14:14 Rt:5 | tbnz {r b5, Rt}, {imm b5 << 5|b40}, {target sext(imm14, 14) * 4}
+
+# ---------------------------------------------------------------- loads and stores
+# exclusive, ordered, compare-and-swap (Rs/Rt2 that the architecture fixes to ones are ignored, as in LLVM)
+STXRB        00 001000 000 Rs:5 0 xxxxx Rn:5 Rt:5 | stxrb {w Rs}, {w Rt}, [{xsp Rn}]
+STLXRB       00 001000 000 Rs:5 1 xxxxx Rn:5 Rt:5 | stlxrb {w Rs}, {w Rt}, [{xsp Rn}]
+LDXRB        00 001000 010 xxxxx 0 xxxxx Rn:5 Rt:5 | ldxrb {w Rt}, [{xsp Rn}]
+LDAXRB       00 001000 010 xxxxx 1 xxxxx Rn:5 Rt:5 | ldaxrb {w Rt}, [{xsp Rn}]
+STLLRB       00 001000 100 xxxxx 0 xxxxx Rn:5 Rt:5 @lor | stllrb {w Rt}, [{xsp Rn}]
+STLRB        00 001000 100 xxxxx 1 xxxxx Rn:5 Rt:5 | stlrb {w Rt}, [{xsp Rn}]
+LDLARB       00 001000 110 xxxxx 0 xxxxx Rn:5 Rt:5 @lor | ldlarb {w Rt}, [{xsp Rn}]
+LDARB        00 001000 110 xxxxx 1 xxxxx Rn:5 Rt:5 | ldarb {w Rt}, [{xsp Rn}]
+STXRH        01 001000 000 Rs:5 0 xxxxx Rn:5 Rt:5 | stxrh {w Rs}, {w Rt}, [{xsp Rn}]
+STLXRH       01 001000 000 Rs:5 1 xxxxx Rn:5 Rt:5 | stlxrh {w Rs}, {w Rt}, [{xsp Rn}]
+LDXRH        01 001000 010 xxxxx 0 xxxxx Rn:5 Rt:5 | ldxrh {w Rt}, [{xsp Rn}]
+LDAXRH       01 001000 010 xxxxx 1 xxxxx Rn:5 Rt:5 | ldaxrh {w Rt}, [{xsp Rn}]
+STLLRH       01 001000 100 xxxxx 0 xxxxx Rn:5 Rt:5 @lor | stllrh {w Rt}, [{xsp Rn}]
+STLRH        01 001000 100 xxxxx 1 xxxxx Rn:5 Rt:5 | stlrh {w Rt}, [{xsp Rn}]
+LDLARH       01 001000 110 xxxxx 0 xxxxx Rn:5 Rt:5 @lor | ldlarh {w Rt}, [{xsp Rn}]
+LDARH        01 001000 110 xxxxx 1 xxxxx Rn:5 Rt:5 | ldarh {w Rt}, [{xsp Rn}]
+STXR         1 sf 001000 000 Rs:5 0 xxxxx Rn:5 Rt:5 | stxr {w Rs}, {r sf, Rt}, [{xsp Rn}]
+STLXR        1 sf 001000 000 Rs:5 1 xxxxx Rn:5 Rt:5 | stlxr {w Rs}, {r sf, Rt}, [{xsp Rn}]
+LDXR         1 sf 001000 010 xxxxx 0 xxxxx Rn:5 Rt:5 | ldxr {r sf, Rt}, [{xsp Rn}]
+LDAXR        1 sf 001000 010 xxxxx 1 xxxxx Rn:5 Rt:5 | ldaxr {r sf, Rt}, [{xsp Rn}]
+STLLR        1 sf 001000 100 xxxxx 0 xxxxx Rn:5 Rt:5 @lor | stllr {r sf, Rt}, [{xsp Rn}]
+STLR         1 sf 001000 100 xxxxx 1 xxxxx Rn:5 Rt:5 | stlr {r sf, Rt}, [{xsp Rn}]
+LDLAR        1 sf 001000 110 xxxxx 0 xxxxx Rn:5 Rt:5 @lor | ldlar {r sf, Rt}, [{xsp Rn}]
+LDAR         1 sf 001000 110 xxxxx 1 xxxxx Rn:5 Rt:5 | ldar {r sf, Rt}, [{xsp Rn}]
+STXP         1 sf 001000 001 Rs:5 0 Rt2:5 Rn:5 Rt:5 | stxp {w Rs}, {r sf, Rt}, {r sf, Rt2}, [{xsp Rn}]
+STLXP        1 sf 001000 001 Rs:5 1 Rt2:5 Rn:5 Rt:5 | stlxp {w Rs}, {r sf, Rt}, {r sf, Rt2}, [{xsp Rn}]
+LDXP         1 sf 001000 011 xxxxx 0 Rt2:5 Rn:5 Rt:5 | ldxp {r sf, Rt}, {r sf, Rt2}, [{xsp Rn}]
+LDAXP        1 sf 001000 011 xxxxx 1 Rt2:5 Rn:5 Rt:5 | ldaxp {r sf, Rt}, {r sf, Rt2}, [{xsp Rn}]
+CASP         0 sz 001000 0 L 1 Rs:5 o0 11111 Rn:5 Rt:5 !Rs=xxxx1 !Rt=xxxx1 @lse | casp{s ar(L, o0)} {pair sz, Rs}, {pair sz, Rt}, [{xsp Rn}]
+CAS          size:2 001000 1 L 1 Rs:5 o0 11111 Rn:5 Rt:5 @lse | cas{s ar(L, o0)}{s bh(size)} {r size == 3, Rs}, {r size == 3, Rt}, [{xsp Rn}]
+
+# RCpc unscaled immediate (v8.4)
+STLURB       00 011001 00 0 imm9:9 00 Rn:5 Rt:5 @rcpc-immo | stlurb {w Rt}, [{xsp Rn}{off sext(imm9, 9)}]
+LDAPURB      00 011001 01 0 imm9:9 00 Rn:5 Rt:5 @rcpc-immo | ldapurb {w Rt}, [{xsp Rn}{off sext(imm9, 9)}]
+LDAPURSB     00 011001 1 opc0 0 imm9:9 00 Rn:5 Rt:5 @rcpc-immo | ldapursb {r 1 - opc0, Rt}, [{xsp Rn}{off sext(imm9, 9)}]
+STLURH       01 011001 00 0 imm9:9 00 Rn:5 Rt:5 @rcpc-immo | stlurh {w Rt}, [{xsp Rn}{off sext(imm9, 9)}]
+LDAPURH      01 011001 01 0 imm9:9 00 Rn:5 Rt:5 @rcpc-immo | ldapurh {w Rt}, [{xsp Rn}{off sext(imm9, 9)}]
+LDAPURSH     01 011001 1 opc0 0 imm9:9 00 Rn:5 Rt:5 @rcpc-immo | ldapursh {r 1 - opc0, Rt}, [{xsp Rn}{off sext(imm9, 9)}]
+STLUR        1 sf 011001 00 0 imm9:9 00 Rn:5 Rt:5 @rcpc-immo | stlur {r sf, Rt}, [{xsp Rn}{off sext(imm9, 9)}]
+LDAPUR       1 sf 011001 01 0 imm9:9 00 Rn:5 Rt:5 @rcpc-immo | ldapur {r sf, Rt}, [{xsp Rn}{off sext(imm9, 9)}]
+LDAPURSW     10 011001 10 0 imm9:9 00 Rn:5 Rt:5 @rcpc-immo | ldapursw {x Rt}, [{xsp Rn}{off sext(imm9, 9)}]
+
+# literal
+LDR_lit      0 sf 011 0 00 imm19:19 Rt:5 | ldr {r sf, Rt}, {target sext(imm19, 19) * 4}
+LDRSW_lit    10 011 0 00 imm19:19 Rt:5 | ldrsw {x Rt}, {target sext(imm19, 19) * 4}
+PRFM_lit     11 011 0 00 imm19:19 Rt:5 | prfm {prfop Rt}, {target sext(imm19, 19) * 4}
+LDR_lit_fp   opc:2 011 1 00 imm19:19 Rt:5 !opc=11 | ldr {vs Rt, opc + 2}, {target sext(imm19, 19) * 4}
+
+# pairs: no-allocate, post-index, signed offset, pre-index
+STNP         sf 0 101 0 000 0 imm7:7 Rt2:5 Rn:5 Rt:5 | stnp {r sf, Rt}, {r sf, Rt2}, [{xsp Rn}{off sext(imm7, 7) << (2 + sf)}]
+LDNP         sf 0 101 0 000 1 imm7:7 Rt2:5 Rn:5 Rt:5 | ldnp {r sf, Rt}, {r sf, Rt2}, [{xsp Rn}{off sext(imm7, 7) << (2 + sf)}]
+STP_post     sf 0 101 0 001 0 imm7:7 Rt2:5 Rn:5 Rt:5 | stp {r sf, Rt}, {r sf, Rt2}, [{xsp Rn}], {imm sext(imm7, 7) << (2 + sf)}
+LDP_post     sf 0 101 0 001 1 imm7:7 Rt2:5 Rn:5 Rt:5 | ldp {r sf, Rt}, {r sf, Rt2}, [{xsp Rn}], {imm sext(imm7, 7) << (2 + sf)}
+STP_off      sf 0 101 0 010 0 imm7:7 Rt2:5 Rn:5 Rt:5 | stp {r sf, Rt}, {r sf, Rt2}, [{xsp Rn}{off sext(imm7, 7) << (2 + sf)}]
+LDP_off      sf 0 101 0 010 1 imm7:7 Rt2:5 Rn:5 Rt:5 | ldp {r sf, Rt}, {r sf, Rt2}, [{xsp Rn}{off sext(imm7, 7) << (2 + sf)}]
+STP_pre      sf 0 101 0 011 0 imm7:7 Rt2:5 Rn:5 Rt:5 | stp {r sf, Rt}, {r sf, Rt2}, [{xsp Rn}{offz sext(imm7, 7) << (2 + sf)}]!
+LDP_pre      sf 0 101 0 011 1 imm7:7 Rt2:5 Rn:5 Rt:5 | ldp {r sf, Rt}, {r sf, Rt2}, [{xsp Rn}{offz sext(imm7, 7) << (2 + sf)}]!
+LDPSW_post   01 101 0 001 1 imm7:7 Rt2:5 Rn:5 Rt:5 | ldpsw {x Rt}, {x Rt2}, [{xsp Rn}], {imm sext(imm7, 7) * 4}
+LDPSW_off    01 101 0 010 1 imm7:7 Rt2:5 Rn:5 Rt:5 | ldpsw {x Rt}, {x Rt2}, [{xsp Rn}{off sext(imm7, 7) * 4}]
+LDPSW_pre    01 101 0 011 1 imm7:7 Rt2:5 Rn:5 Rt:5 | ldpsw {x Rt}, {x Rt2}, [{xsp Rn}{offz sext(imm7, 7) * 4}]!
+STNP_fp      opc:2 101 1 000 0 imm7:7 Rt2:5 Rn:5 Rt:5 !opc=11 | stnp {vs Rt, opc + 2}, {vs Rt2, opc + 2}, [{xsp Rn}{off sext(imm7, 7) << (2 + opc)}]
+LDNP_fp      opc:2 101 1 000 1 imm7:7 Rt2:5 Rn:5 Rt:5 !opc=11 | ldnp {vs Rt, opc + 2}, {vs Rt2, opc + 2}, [{xsp Rn}{off sext(imm7, 7) << (2 + opc)}]
+STP_fp_post  opc:2 101 1 001 0 imm7:7 Rt2:5 Rn:5 Rt:5 !opc=11 | stp {vs Rt, opc + 2}, {vs Rt2, opc + 2}, [{xsp Rn}], {imm sext(imm7, 7) << (2 + opc)}
+LDP_fp_post  opc:2 101 1 001 1 imm7:7 Rt2:5 Rn:5 Rt:5 !opc=11 | ldp {vs Rt, opc + 2}, {vs Rt2, opc + 2}, [{xsp Rn}], {imm sext(imm7, 7) << (2 + opc)}
+STP_fp_off   opc:2 101 1 010 0 imm7:7 Rt2:5 Rn:5 Rt:5 !opc=11 | stp {vs Rt, opc + 2}, {vs Rt2, opc + 2}, [{xsp Rn}{off sext(imm7, 7) << (2 + opc)}]
+LDP_fp_off   opc:2 101 1 010 1 imm7:7 Rt2:5 Rn:5 Rt:5 !opc=11 | ldp {vs Rt, opc + 2}, {vs Rt2, opc + 2}, [{xsp Rn}{off sext(imm7, 7) << (2 + opc)}]
+STP_fp_pre   opc:2 101 1 011 0 imm7:7 Rt2:5 Rn:5 Rt:5 !opc=11 | stp {vs Rt, opc + 2}, {vs Rt2, opc + 2}, [{xsp Rn}{offz sext(imm7, 7) << (2 + opc)}]!
+LDP_fp_pre   opc:2 101 1 011 1 imm7:7 Rt2:5 Rn:5 Rt:5 !opc=11 | ldp {vs Rt, opc + 2}, {vs Rt2, opc + 2}, [{xsp Rn}{offz sext(imm7, 7) << (2 + opc)}]!
+
+# single register, general: unscaled (STUR..), post-index, unprivileged (STTR..), pre-index, register offset, unsigned offset
+STURB        00 111 0 00 00 0 imm9:9 00 Rn:5 Rt:5 | sturb {w Rt}, [{xsp Rn}{off sext(imm9, 9)}]
+LDURB        00 111 0 00 01 0 imm9:9 00 Rn:5 Rt:5 | ldurb {w Rt}, [{xsp Rn}{off sext(imm9, 9)}]
+LDURSB       00 111 0 00 1 opc0 0 imm9:9 00 Rn:5 Rt:5 | ldursb {r 1 - opc0, Rt}, [{xsp Rn}{off sext(imm9, 9)}]
+STURH        01 111 0 00 00 0 imm9:9 00 Rn:5 Rt:5 | sturh {w Rt}, [{xsp Rn}{off sext(imm9, 9)}]
+LDURH        01 111 0 00 01 0 imm9:9 00 Rn:5 Rt:5 | ldurh {w Rt}, [{xsp Rn}{off sext(imm9, 9)}]
+LDURSH       01 111 0 00 1 opc0 0 imm9:9 00 Rn:5 Rt:5 | ldursh {r 1 - opc0, Rt}, [{xsp Rn}{off sext(imm9, 9)}]
+STUR         1 sf 111 0 00 00 0 imm9:9 00 Rn:5 Rt:5 | stur {r sf, Rt}, [{xsp Rn}{off sext(imm9, 9)}]
+LDUR         1 sf 111 0 00 01 0 imm9:9 00 Rn:5 Rt:5 | ldur {r sf, Rt}, [{xsp Rn}{off sext(imm9, 9)}]
+LDURSW       10 111 0 00 10 0 imm9:9 00 Rn:5 Rt:5 | ldursw {x Rt}, [{xsp Rn}{off sext(imm9, 9)}]
+PRFUM        11 111 0 00 10 0 imm9:9 00 Rn:5 Rt:5 | prfum {prfop Rt}, [{xsp Rn}{off sext(imm9, 9)}]
+STUR_fp      size:2 111 1 00 opc1 0 0 imm9:9 00 Rn:5 Rt:5 !opc1=1,size=1x !opc1=1,size=01 | stur {vs Rt, opc1 ? 4 : size}, [{xsp Rn}{off sext(imm9, 9)}]
+LDUR_fp      size:2 111 1 00 opc1 1 0 imm9:9 00 Rn:5 Rt:5 !opc1=1,size=1x !opc1=1,size=01 | ldur {vs Rt, opc1 ? 4 : size}, [{xsp Rn}{off sext(imm9, 9)}]
+
+STRB_post    00 111 0 00 00 0 imm9:9 01 Rn:5 Rt:5 | strb {w Rt}, [{xsp Rn}], {imm sext(imm9, 9)}
+LDRB_post    00 111 0 00 01 0 imm9:9 01 Rn:5 Rt:5 | ldrb {w Rt}, [{xsp Rn}], {imm sext(imm9, 9)}
+LDRSB_post   00 111 0 00 1 opc0 0 imm9:9 01 Rn:5 Rt:5 | ldrsb {r 1 - opc0, Rt}, [{xsp Rn}], {imm sext(imm9, 9)}
+STRH_post    01 111 0 00 00 0 imm9:9 01 Rn:5 Rt:5 | strh {w Rt}, [{xsp Rn}], {imm sext(imm9, 9)}
+LDRH_post    01 111 0 00 01 0 imm9:9 01 Rn:5 Rt:5 | ldrh {w Rt}, [{xsp Rn}], {imm sext(imm9, 9)}
+LDRSH_post   01 111 0 00 1 opc0 0 imm9:9 01 Rn:5 Rt:5 | ldrsh {r 1 - opc0, Rt}, [{xsp Rn}], {imm sext(imm9, 9)}
+STR_post     1 sf 111 0 00 00 0 imm9:9 01 Rn:5 Rt:5 | str {r sf, Rt}, [{xsp Rn}], {imm sext(imm9, 9)}
+LDR_post     1 sf 111 0 00 01 0 imm9:9 01 Rn:5 Rt:5 | ldr {r sf, Rt}, [{xsp Rn}], {imm sext(imm9, 9)}
+LDRSW_post   10 111 0 00 10 0 imm9:9 01 Rn:5 Rt:5 | ldrsw {x Rt}, [{xsp Rn}], {imm sext(imm9, 9)}
+STR_fp_post  size:2 111 1 00 opc1 0 0 imm9:9 01 Rn:5 Rt:5 !opc1=1,size=1x !opc1=1,size=01 | str {vs Rt, opc1 ? 4 : size}, [{xsp Rn}], {imm sext(imm9, 9)}
+LDR_fp_post  size:2 111 1 00 opc1 1 0 imm9:9 01 Rn:5 Rt:5 !opc1=1,size=1x !opc1=1,size=01 | ldr {vs Rt, opc1 ? 4 : size}, [{xsp Rn}], {imm sext(imm9, 9)}
+
+STTRB        00 111 0 00 00 0 imm9:9 10 Rn:5 Rt:5 | sttrb {w Rt}, [{xsp Rn}{off sext(imm9, 9)}]
+LDTRB        00 111 0 00 01 0 imm9:9 10 Rn:5 Rt:5 | ldtrb {w Rt}, [{xsp Rn}{off sext(imm9, 9)}]
+LDTRSB       00 111 0 00 1 opc0 0 imm9:9 10 Rn:5 Rt:5 | ldtrsb {r 1 - opc0, Rt}, [{xsp Rn}{off sext(imm9, 9)}]
+STTRH        01 111 0 00 00 0 imm9:9 10 Rn:5 Rt:5 | sttrh {w Rt}, [{xsp Rn}{off sext(imm9, 9)}]
+LDTRH        01 111 0 00 01 0 imm9:9 10 Rn:5 Rt:5 | ldtrh {w Rt}, [{xsp Rn}{off sext(imm9, 9)}]
+LDTRSH       01 111 0 00 1 opc0 0 imm9:9 10 Rn:5 Rt:5 | ldtrsh {r 1 - opc0, Rt}, [{xsp Rn}{off sext(imm9, 9)}]
+STTR         1 sf 111 0 00 00 0 imm9:9 10 Rn:5 Rt:5 | sttr {r sf, Rt}, [{xsp Rn}{off sext(imm9, 9)}]
+LDTR         1 sf 111 0 00 01 0 imm9:9 10 Rn:5 Rt:5 | ldtr {r sf, Rt}, [{xsp Rn}{off sext(imm9, 9)}]
+LDTRSW       10 111 0 00 10 0 imm9:9 10 Rn:5 Rt:5 | ldtrsw {x Rt}, [{xsp Rn}{off sext(imm9, 9)}]
+
+STRB_pre     00 111 0 00 00 0 imm9:9 11 Rn:5 Rt:5 | strb {w Rt}, [{xsp Rn}{offz sext(imm9, 9)}]!
+LDRB_pre     00 111 0 00 01 0 imm9:9 11 Rn:5 Rt:5 | ldrb {w Rt}, [{xsp Rn}{offz sext(imm9, 9)}]!
+LDRSB_pre    00 111 0 00 1 opc0 0 imm9:9 11 Rn:5 Rt:5 | ldrsb {r 1 - opc0, Rt}, [{xsp Rn}{offz sext(imm9, 9)}]!
+STRH_pre     01 111 0 00 00 0 imm9:9 11 Rn:5 Rt:5 | strh {w Rt}, [{xsp Rn}{offz sext(imm9, 9)}]!
+LDRH_pre     01 111 0 00 01 0 imm9:9 11 Rn:5 Rt:5 | ldrh {w Rt}, [{xsp Rn}{offz sext(imm9, 9)}]!
+LDRSH_pre    01 111 0 00 1 opc0 0 imm9:9 11 Rn:5 Rt:5 | ldrsh {r 1 - opc0, Rt}, [{xsp Rn}{offz sext(imm9, 9)}]!
+STR_pre      1 sf 111 0 00 00 0 imm9:9 11 Rn:5 Rt:5 | str {r sf, Rt}, [{xsp Rn}{offz sext(imm9, 9)}]!
+LDR_pre      1 sf 111 0 00 01 0 imm9:9 11 Rn:5 Rt:5 | ldr {r sf, Rt}, [{xsp Rn}{offz sext(imm9, 9)}]!
+LDRSW_pre    10 111 0 00 10 0 imm9:9 11 Rn:5 Rt:5 | ldrsw {x Rt}, [{xsp Rn}{offz sext(imm9, 9)}]!
+STR_fp_pre   size:2 111 1 00 opc1 0 0 imm9:9 11 Rn:5 Rt:5 !opc1=1,size=1x !opc1=1,size=01 | str {vs Rt, opc1 ? 4 : size}, [{xsp Rn}{offz sext(imm9, 9)}]!
+LDR_fp_pre   size:2 111 1 00 opc1 1 0 imm9:9 11 Rn:5 Rt:5 !opc1=1,size=1x !opc1=1,size=01 | ldr {vs Rt, opc1 ? 4 : size}, [{xsp Rn}{offz sext(imm9, 9)}]!
+
+# atomic memory operations (LSE): ld<op>{a}{l}{b|h}; st<op> when A = 0 and Rt = zr
+LDADD        size:2 111 0 00 A R 1 Rs:5 0 000 00 Rn:5 Rt:5 @lse | ldadd{s ar(A, R)}{s bh(size)} {r size == 3, Rs}, {r size == 3, Rt}, [{xsp Rn}]
+= A == 0 && Rt == 31 | stadd{s ar(A, R)}{s bh(size)} {r size == 3, Rs}, [{xsp Rn}]
+LDCLR        size:2 111 0 00 A R 1 Rs:5 0 001 00 Rn:5 Rt:5 @lse | ldclr{s ar(A, R)}{s bh(size)} {r size == 3, Rs}, {r size == 3, Rt}, [{xsp Rn}]
+= A == 0 && Rt == 31 | stclr{s ar(A, R)}{s bh(size)} {r size == 3, Rs}, [{xsp Rn}]
+LDEOR        size:2 111 0 00 A R 1 Rs:5 0 010 00 Rn:5 Rt:5 @lse | ldeor{s ar(A, R)}{s bh(size)} {r size == 3, Rs}, {r size == 3, Rt}, [{xsp Rn}]
+= A == 0 && Rt == 31 | steor{s ar(A, R)}{s bh(size)} {r size == 3, Rs}, [{xsp Rn}]
+LDSET        size:2 111 0 00 A R 1 Rs:5 0 011 00 Rn:5 Rt:5 @lse | ldset{s ar(A, R)}{s bh(size)} {r size == 3, Rs}, {r size == 3, Rt}, [{xsp Rn}]
+= A == 0 && Rt == 31 | stset{s ar(A, R)}{s bh(size)} {r size == 3, Rs}, [{xsp Rn}]
+LDSMAX       size:2 111 0 00 A R 1 Rs:5 0 100 00 Rn:5 Rt:5 @lse | ldsmax{s ar(A, R)}{s bh(size)} {r size == 3, Rs}, {r size == 3, Rt}, [{xsp Rn}]
+= A == 0 && Rt == 31 | stsmax{s ar(A, R)}{s bh(size)} {r size == 3, Rs}, [{xsp Rn}]
+LDSMIN       size:2 111 0 00 A R 1 Rs:5 0 101 00 Rn:5 Rt:5 @lse | ldsmin{s ar(A, R)}{s bh(size)} {r size == 3, Rs}, {r size == 3, Rt}, [{xsp Rn}]
+= A == 0 && Rt == 31 | stsmin{s ar(A, R)}{s bh(size)} {r size == 3, Rs}, [{xsp Rn}]
+LDUMAX       size:2 111 0 00 A R 1 Rs:5 0 110 00 Rn:5 Rt:5 @lse | ldumax{s ar(A, R)}{s bh(size)} {r size == 3, Rs}, {r size == 3, Rt}, [{xsp Rn}]
+= A == 0 && Rt == 31 | stumax{s ar(A, R)}{s bh(size)} {r size == 3, Rs}, [{xsp Rn}]
+LDUMIN       size:2 111 0 00 A R 1 Rs:5 0 111 00 Rn:5 Rt:5 @lse | ldumin{s ar(A, R)}{s bh(size)} {r size == 3, Rs}, {r size == 3, Rt}, [{xsp Rn}]
+= A == 0 && Rt == 31 | stumin{s ar(A, R)}{s bh(size)} {r size == 3, Rs}, [{xsp Rn}]
+SWP          size:2 111 0 00 A R 1 Rs:5 1 000 00 Rn:5 Rt:5 @lse | swp{s ar(A, R)}{s bh(size)} {r size == 3, Rs}, {r size == 3, Rt}, [{xsp Rn}]
+LDAPR        size:2 111 0 00 1 0 1 xxxxx 1 100 00 Rn:5 Rt:5 @rcpc | ldapr{s bh(size)} {r size == 3, Rt}, [{xsp Rn}]
+
+# pointer authentication loads
+LDRAA        11 111 0 00 M S 1 imm9:9 W 1 Rn:5 Rt:5 @pauth | {s M ? "ldrab" : "ldraa"} {x Rt}, [{xsp Rn}{ldra_off sext(S << 9|imm9, 10) * 8, W}
+
+# register offset (option<1> must be 1)
+STRB_reg     00 111 0 00 00 1 Rm:5 option:3 S 10 Rn:5 Rt:5 !option=x0x | strb {w Rt}, [{xsp Rn}, {r option & 1, Rm}{memext option, S, 0}]
+LDRB_reg     00 111 0 00 01 1 Rm:5 option:3 S 10 Rn:5 Rt:5 !option=x0x | ldrb {w Rt}, [{xsp Rn}, {r option & 1, Rm}{memext option, S, 0}]
+LDRSB_reg    00 111 0 00 1 opc0 1 Rm:5 option:3 S 10 Rn:5 Rt:5 !option=x0x | ldrsb {r 1 - opc0, Rt}, [{xsp Rn}, {r option & 1, Rm}{memext option, S, 0}]
+STRH_reg     01 111 0 00 00 1 Rm:5 option:3 S 10 Rn:5 Rt:5 !option=x0x | strh {w Rt}, [{xsp Rn}, {r option & 1, Rm}{memext option, S, 1}]
+LDRH_reg     01 111 0 00 01 1 Rm:5 option:3 S 10 Rn:5 Rt:5 !option=x0x | ldrh {w Rt}, [{xsp Rn}, {r option & 1, Rm}{memext option, S, 1}]
+LDRSH_reg    01 111 0 00 1 opc0 1 Rm:5 option:3 S 10 Rn:5 Rt:5 !option=x0x | ldrsh {r 1 - opc0, Rt}, [{xsp Rn}, {r option & 1, Rm}{memext option, S, 1}]
+STR_reg      1 sf 111 0 00 00 1 Rm:5 option:3 S 10 Rn:5 Rt:5 !option=x0x | str {r sf, Rt}, [{xsp Rn}, {r option & 1, Rm}{memext option, S, 2 + sf}]
+LDR_reg      1 sf 111 0 00 01 1 Rm:5 option:3 S 10 Rn:5 Rt:5 !option=x0x | ldr {r sf, Rt}, [{xsp Rn}, {r option & 1, Rm}{memext option, S, 2 + sf}]
+LDRSW_reg    10 111 0 00 10 1 Rm:5 option:3 S 10 Rn:5 Rt:5 !option=x0x | ldrsw {x Rt}, [{xsp Rn}, {r option & 1, Rm}{memext option, S, 2}]
+RPRFM        11 111 0 00 10 1 Rm:5 o2 1 o0 S 10 Rn:5 11 rt:3 @rprfm | rprfm {name names_rprfm, o2 << 5|o0 << 4|S << 3|rt, "", o2 << 5|o0 << 4|S << 3|rt}, {x Rm}, [{xsp Rn}]
+PRFM_reg     11 111 0 00 10 1 Rm:5 option:3 S 10 Rn:5 Rt:5 !option=x0x | prfm {prfop Rt}, [{xsp Rn}, {r option & 1, Rm}{memext option, S, 3}]
+STR_fp_reg   size:2 111 1 00 opc1 0 1 Rm:5 option:3 S 10 Rn:5 Rt:5 !option=x0x !opc1=1,size=1x !opc1=1,size=01 | str {vs Rt, opc1 ? 4 : size}, [{xsp Rn}, {r option & 1, Rm}{memext option, S, opc1 ? 4 : size}]
+LDR_fp_reg   size:2 111 1 00 opc1 1 1 Rm:5 option:3 S 10 Rn:5 Rt:5 !option=x0x !opc1=1,size=1x !opc1=1,size=01 | ldr {vs Rt, opc1 ? 4 : size}, [{xsp Rn}, {r option & 1, Rm}{memext option, S, opc1 ? 4 : size}]
+
+# unsigned offset
+STRB_imm     00 111 0 01 00 imm12:12 Rn:5 Rt:5 | strb {w Rt}, [{xsp Rn}{off imm12}]
+LDRB_imm     00 111 0 01 01 imm12:12 Rn:5 Rt:5 | ldrb {w Rt}, [{xsp Rn}{off imm12}]
+LDRSB_imm    00 111 0 01 1 opc0 imm12:12 Rn:5 Rt:5 | ldrsb {r 1 - opc0, Rt}, [{xsp Rn}{off imm12}]
+STRH_imm     01 111 0 01 00 imm12:12 Rn:5 Rt:5 | strh {w Rt}, [{xsp Rn}{off imm12 * 2}]
+LDRH_imm     01 111 0 01 01 imm12:12 Rn:5 Rt:5 | ldrh {w Rt}, [{xsp Rn}{off imm12 * 2}]
+LDRSH_imm    01 111 0 01 1 opc0 imm12:12 Rn:5 Rt:5 | ldrsh {r 1 - opc0, Rt}, [{xsp Rn}{off imm12 * 2}]
+STR_imm      1 sf 111 0 01 00 imm12:12 Rn:5 Rt:5 | str {r sf, Rt}, [{xsp Rn}{off imm12 << (2 + sf)}]
+LDR_imm      1 sf 111 0 01 01 imm12:12 Rn:5 Rt:5 | ldr {r sf, Rt}, [{xsp Rn}{off imm12 << (2 + sf)}]
+LDRSW_imm    10 111 0 01 10 imm12:12 Rn:5 Rt:5 | ldrsw {x Rt}, [{xsp Rn}{off imm12 * 4}]
+PRFM_imm     11 111 0 01 10 imm12:12 Rn:5 Rt:5 | prfm {prfop Rt}, [{xsp Rn}{off imm12 * 8}]
+STR_fp_imm   size:2 111 1 01 opc1 0 imm12:12 Rn:5 Rt:5 !opc1=1,size=1x !opc1=1,size=01 | str {vs Rt, opc1 ? 4 : size}, [{xsp Rn}{off imm12 << (opc1 ? 4 : size)}]
+LDR_fp_imm   size:2 111 1 01 opc1 1 imm12:12 Rn:5 Rt:5 !opc1=1,size=1x !opc1=1,size=01 | ldr {vs Rt, opc1 ? 4 : size}, [{xsp Rn}{off imm12 << (opc1 ? 4 : size)}]
+
+# ---------------------------------------------------------------- data processing: register
+UDIV         sf 0 0 11010110 Rm:5 00001 0 Rn:5 Rd:5 | udiv {r sf, Rd}, {r sf, Rn}, {r sf, Rm}
+SDIV         sf 0 0 11010110 Rm:5 00001 1 Rn:5 Rd:5 | sdiv {r sf, Rd}, {r sf, Rn}, {r sf, Rm}
+LSLV         sf 0 0 11010110 Rm:5 0010 00 Rn:5 Rd:5 | lsl {r sf, Rd}, {r sf, Rn}, {r sf, Rm}
+LSRV         sf 0 0 11010110 Rm:5 0010 01 Rn:5 Rd:5 | lsr {r sf, Rd}, {r sf, Rn}, {r sf, Rm}
+ASRV         sf 0 0 11010110 Rm:5 0010 10 Rn:5 Rd:5 | asr {r sf, Rd}, {r sf, Rn}, {r sf, Rm}
+RORV         sf 0 0 11010110 Rm:5 0010 11 Rn:5 Rd:5 | ror {r sf, Rd}, {r sf, Rn}, {r sf, Rm}
+PACGA        1 0 0 11010110 Rm:5 001100 Rn:5 Rd:5 @pauth | pacga {x Rd}, {x Rn}, {xsp Rm}
+CRC32        sf 0 0 11010110 Rm:5 010 C sz:2 Rn:5 Rd:5 !sf=0,sz=11 !sf=1,sz=0x !sf=1,sz=10 @crc | crc32{s C ? "c" : ""}{s crcsz(sz)} {w Rd}, {w Rn}, {r sz == 3, Rm}
+
+RBIT         sf 1 0 11010110 00000 000000 Rn:5 Rd:5 | rbit {r sf, Rd}, {r sf, Rn}
+REV16        sf 1 0 11010110 00000 000001 Rn:5 Rd:5 | rev16 {r sf, Rd}, {r sf, Rn}
+REV32        1 1 0 11010110 00000 000010 Rn:5 Rd:5 | rev32 {x Rd}, {x Rn}
+REV_w        0 1 0 11010110 00000 000010 Rn:5 Rd:5 | rev {w Rd}, {w Rn}
+REV_x        1 1 0 11010110 00000 000011 Rn:5 Rd:5 | rev {x Rd}, {x Rn}
+CLZ          sf 1 0 11010110 00000 000100 Rn:5 Rd:5 | clz {r sf, Rd}, {r sf, Rn}
+CLS          sf 1 0 11010110 00000 000101 Rn:5 Rd:5 | cls {r sf, Rd}, {r sf, Rn}
+PAC          1 1 0 11010110 00001 00 Z 0 D key Rn:5 Rd:5 @pauth ? !Z || Rn == 31 | {s pacname(0, Z, D, key)} {x Rd}{pacrn Z, Rn}
+AUT          1 1 0 11010110 00001 00 Z 1 D key Rn:5 Rd:5 @pauth ? !Z || Rn == 31 | {s pacname(1, Z, D, key)} {x Rd}{pacrn Z, Rn}
+XPACI        1 1 0 11010110 00001 01000 D 11111 Rd:5 @pauth | {s D ? "xpacd" : "xpaci"} {x Rd}
+
+AND_reg      sf 00 01010 shift:2 0 Rm:5 imm6:6 Rn:5 Rd:5 !sf=0,imm6=1xxxxx | and {r sf, Rd}, {r sf, Rn}, {r sf, Rm}{shift shift, imm6}
+BIC_reg      sf 00 01010 shift:2 1 Rm:5 imm6:6 Rn:5 Rd:5 !sf=0,imm6=1xxxxx | bic {r sf, Rd}, {r sf, Rn}, {r sf, Rm}{shift shift, imm6}
+ORR_reg      sf 01 01010 shift:2 0 Rm:5 imm6:6 Rn:5 Rd:5 !sf=0,imm6=1xxxxx | orr {r sf, Rd}, {r sf, Rn}, {r sf, Rm}{shift shift, imm6}
+= Rn == 31 && shift == 0 && imm6 == 0 | mov {r sf, Rd}, {r sf, Rm}
+ORN_reg      sf 01 01010 shift:2 1 Rm:5 imm6:6 Rn:5 Rd:5 !sf=0,imm6=1xxxxx | orn {r sf, Rd}, {r sf, Rn}, {r sf, Rm}{shift shift, imm6}
+= Rn == 31 | mvn {r sf, Rd}, {r sf, Rm}{shift shift, imm6}
+EOR_reg      sf 10 01010 shift:2 0 Rm:5 imm6:6 Rn:5 Rd:5 !sf=0,imm6=1xxxxx | eor {r sf, Rd}, {r sf, Rn}, {r sf, Rm}{shift shift, imm6}
+EON_reg      sf 10 01010 shift:2 1 Rm:5 imm6:6 Rn:5 Rd:5 !sf=0,imm6=1xxxxx | eon {r sf, Rd}, {r sf, Rn}, {r sf, Rm}{shift shift, imm6}
+ANDS_reg     sf 11 01010 shift:2 0 Rm:5 imm6:6 Rn:5 Rd:5 !sf=0,imm6=1xxxxx | ands {r sf, Rd}, {r sf, Rn}, {r sf, Rm}{shift shift, imm6}
+= Rd == 31 | tst {r sf, Rn}, {r sf, Rm}{shift shift, imm6}
+BICS_reg     sf 11 01010 shift:2 1 Rm:5 imm6:6 Rn:5 Rd:5 !sf=0,imm6=1xxxxx | bics {r sf, Rd}, {r sf, Rn}, {r sf, Rm}{shift shift, imm6}
+
+ADD_reg      sf 0 0 01011 shift:2 0 Rm:5 imm6:6 Rn:5 Rd:5 !shift=11 !sf=0,imm6=1xxxxx | add {r sf, Rd}, {r sf, Rn}, {r sf, Rm}{shift shift, imm6}
+ADDS_reg     sf 0 1 01011 shift:2 0 Rm:5 imm6:6 Rn:5 Rd:5 !shift=11 !sf=0,imm6=1xxxxx | adds {r sf, Rd}, {r sf, Rn}, {r sf, Rm}{shift shift, imm6}
+= Rd == 31 | cmn {r sf, Rn}, {r sf, Rm}{shift shift, imm6}
+SUB_reg      sf 1 0 01011 shift:2 0 Rm:5 imm6:6 Rn:5 Rd:5 !shift=11 !sf=0,imm6=1xxxxx | sub {r sf, Rd}, {r sf, Rn}, {r sf, Rm}{shift shift, imm6}
+= Rn == 31 | neg {r sf, Rd}, {r sf, Rm}{shift shift, imm6}
+SUBS_reg     sf 1 1 01011 shift:2 0 Rm:5 imm6:6 Rn:5 Rd:5 !shift=11 !sf=0,imm6=1xxxxx | subs {r sf, Rd}, {r sf, Rn}, {r sf, Rm}{shift shift, imm6}
+= Rd == 31 | cmp {r sf, Rn}, {r sf, Rm}{shift shift, imm6}
+= Rn == 31 | negs {r sf, Rd}, {r sf, Rm}{shift shift, imm6}
+
+ADD_ext      sf 0 0 01011 00 1 Rm:5 option:3 imm3:3 Rn:5 Rd:5 ? imm3 <= 4 | add {rsp sf, Rd}, {rsp sf, Rn}, {r sf && (option & 3) == 3, Rm}{ext sf, Rd == 31 || Rn == 31, option, imm3}
+ADDS_ext     sf 0 1 01011 00 1 Rm:5 option:3 imm3:3 Rn:5 Rd:5 ? imm3 <= 4 | adds {r sf, Rd}, {rsp sf, Rn}, {r sf && (option & 3) == 3, Rm}{ext sf, Rn == 31, option, imm3}
+= Rd == 31 | cmn {rsp sf, Rn}, {r sf && (option & 3) == 3, Rm}{ext sf, Rn == 31, option, imm3}
+SUB_ext      sf 1 0 01011 00 1 Rm:5 option:3 imm3:3 Rn:5 Rd:5 ? imm3 <= 4 | sub {rsp sf, Rd}, {rsp sf, Rn}, {r sf && (option & 3) == 3, Rm}{ext sf, Rd == 31 || Rn == 31, option, imm3}
+SUBS_ext     sf 1 1 01011 00 1 Rm:5 option:3 imm3:3 Rn:5 Rd:5 ? imm3 <= 4 | subs {r sf, Rd}, {rsp sf, Rn}, {r sf && (option & 3) == 3, Rm}{ext sf, Rn == 31, option, imm3}
+= Rd == 31 | cmp {rsp sf, Rn}, {r sf && (option & 3) == 3, Rm}{ext sf, Rn == 31, option, imm3}
+
+ADC          sf 0 0 11010000 Rm:5 000000 Rn:5 Rd:5 | adc {r sf, Rd}, {r sf, Rn}, {r sf, Rm}
+ADCS         sf 0 1 11010000 Rm:5 000000 Rn:5 Rd:5 | adcs {r sf, Rd}, {r sf, Rn}, {r sf, Rm}
+SBC          sf 1 0 11010000 Rm:5 000000 Rn:5 Rd:5 | sbc {r sf, Rd}, {r sf, Rn}, {r sf, Rm}
+= Rn == 31 | ngc {r sf, Rd}, {r sf, Rm}
+SBCS         sf 1 1 11010000 Rm:5 000000 Rn:5 Rd:5 | sbcs {r sf, Rd}, {r sf, Rn}, {r sf, Rm}
+= Rn == 31 | ngcs {r sf, Rd}, {r sf, Rm}
+RMIF         1 0 1 11010000 imm6:6 00001 Rn:5 0 mask:4 @flagm | rmif {x Rn}, {imm imm6}, {imm mask}
+SETF         0 0 1 11010000 000000 sz 0010 Rn:5 0 1101 @flagm | {s sz ? "setf16" : "setf8"} {w Rn}
+
+CCMN_reg     sf 0 1 11010010 Rm:5 cond:4 0 0 Rn:5 0 nzcv:4 | ccmn {r sf, Rn}, {r sf, Rm}, {imm nzcv}, {cond cond}
+CCMP_reg     sf 1 1 11010010 Rm:5 cond:4 0 0 Rn:5 0 nzcv:4 | ccmp {r sf, Rn}, {r sf, Rm}, {imm nzcv}, {cond cond}
+CCMN_imm     sf 0 1 11010010 imm5:5 cond:4 1 0 Rn:5 0 nzcv:4 | ccmn {r sf, Rn}, {imm imm5}, {imm nzcv}, {cond cond}
+CCMP_imm     sf 1 1 11010010 imm5:5 cond:4 1 0 Rn:5 0 nzcv:4 | ccmp {r sf, Rn}, {imm imm5}, {imm nzcv}, {cond cond}
+
+CSEL         sf 0 0 11010100 Rm:5 cond:4 00 Rn:5 Rd:5 | csel {r sf, Rd}, {r sf, Rn}, {r sf, Rm}, {cond cond}
+CSINC        sf 0 0 11010100 Rm:5 cond:4 01 Rn:5 Rd:5 | csinc {r sf, Rd}, {r sf, Rn}, {r sf, Rm}, {cond cond}
+= Rn == 31 && Rm == 31 && cond < 14 | cset {r sf, Rd}, {cond cond ^ 1}
+= Rn == Rm && cond < 14 | cinc {r sf, Rd}, {r sf, Rn}, {cond cond ^ 1}
+CSINV        sf 1 0 11010100 Rm:5 cond:4 00 Rn:5 Rd:5 | csinv {r sf, Rd}, {r sf, Rn}, {r sf, Rm}, {cond cond}
+= Rn == 31 && Rm == 31 && cond < 14 | csetm {r sf, Rd}, {cond cond ^ 1}
+= Rn == Rm && cond < 14 | cinv {r sf, Rd}, {r sf, Rn}, {cond cond ^ 1}
+CSNEG        sf 1 0 11010100 Rm:5 cond:4 01 Rn:5 Rd:5 | csneg {r sf, Rd}, {r sf, Rn}, {r sf, Rm}, {cond cond}
+= Rn == Rm && cond < 14 | cneg {r sf, Rd}, {r sf, Rn}, {cond cond ^ 1}
+
+MADD         sf 00 11011 000 Rm:5 0 Ra:5 Rn:5 Rd:5 | madd {r sf, Rd}, {r sf, Rn}, {r sf, Rm}, {r sf, Ra}
+= Ra == 31 | mul {r sf, Rd}, {r sf, Rn}, {r sf, Rm}
+MSUB         sf 00 11011 000 Rm:5 1 Ra:5 Rn:5 Rd:5 | msub {r sf, Rd}, {r sf, Rn}, {r sf, Rm}, {r sf, Ra}
+= Ra == 31 | mneg {r sf, Rd}, {r sf, Rn}, {r sf, Rm}
+SMADDL       1 00 11011 001 Rm:5 0 Ra:5 Rn:5 Rd:5 | smaddl {x Rd}, {w Rn}, {w Rm}, {x Ra}
+= Ra == 31 | smull {x Rd}, {w Rn}, {w Rm}
+SMSUBL       1 00 11011 001 Rm:5 1 Ra:5 Rn:5 Rd:5 | smsubl {x Rd}, {w Rn}, {w Rm}, {x Ra}
+= Ra == 31 | smnegl {x Rd}, {w Rn}, {w Rm}
+SMULH        1 00 11011 010 Rm:5 0 xxxxx Rn:5 Rd:5 | smulh {x Rd}, {x Rn}, {x Rm}
+UMADDL       1 00 11011 101 Rm:5 0 Ra:5 Rn:5 Rd:5 | umaddl {x Rd}, {w Rn}, {w Rm}, {x Ra}
+= Ra == 31 | umull {x Rd}, {w Rn}, {w Rm}
+UMSUBL       1 00 11011 101 Rm:5 1 Ra:5 Rn:5 Rd:5 | umsubl {x Rd}, {w Rn}, {w Rm}, {x Ra}
+= Ra == 31 | umnegl {x Rd}, {w Rn}, {w Rm}
+UMULH        1 00 11011 110 Rm:5 0 xxxxx Rn:5 Rd:5 | umulh {x Rd}, {x Rn}, {x Rm}
+
+# ---------------------------------------------------------------- scalar floating point (ft: 0 single, 1 double; half precision needs FP16)
+SCVTF_fix        sf 0 0 11110 0 ft 0 00 010 scale:6 Rn:5 Rd:5 !sf=0,scale=0xxxxx | scvtf {vs Rd, 2 + ft}, {r sf, Rn}, {imm 64 - scale}
+UCVTF_fix        sf 0 0 11110 0 ft 0 00 011 scale:6 Rn:5 Rd:5 !sf=0,scale=0xxxxx | ucvtf {vs Rd, 2 + ft}, {r sf, Rn}, {imm 64 - scale}
+FCVTZS_fix       sf 0 0 11110 0 ft 0 11 000 scale:6 Rn:5 Rd:5 !sf=0,scale=0xxxxx | fcvtzs {r sf, Rd}, {vs Rn, 2 + ft}, {imm 64 - scale}
+FCVTZU_fix       sf 0 0 11110 0 ft 0 11 001 scale:6 Rn:5 Rd:5 !sf=0,scale=0xxxxx | fcvtzu {r sf, Rd}, {vs Rn, 2 + ft}, {imm 64 - scale}
+FCVTNS_int       sf 0 0 11110 0 ft 1 00 000 000000 Rn:5 Rd:5 | fcvtns {r sf, Rd}, {vs Rn, 2 + ft}
+FCVTNU_int       sf 0 0 11110 0 ft 1 00 001 000000 Rn:5 Rd:5 | fcvtnu {r sf, Rd}, {vs Rn, 2 + ft}
+FCVTAS_int       sf 0 0 11110 0 ft 1 00 100 000000 Rn:5 Rd:5 | fcvtas {r sf, Rd}, {vs Rn, 2 + ft}
+FCVTAU_int       sf 0 0 11110 0 ft 1 00 101 000000 Rn:5 Rd:5 | fcvtau {r sf, Rd}, {vs Rn, 2 + ft}
+FCVTPS_int       sf 0 0 11110 0 ft 1 01 000 000000 Rn:5 Rd:5 | fcvtps {r sf, Rd}, {vs Rn, 2 + ft}
+FCVTPU_int       sf 0 0 11110 0 ft 1 01 001 000000 Rn:5 Rd:5 | fcvtpu {r sf, Rd}, {vs Rn, 2 + ft}
+FCVTMS_int       sf 0 0 11110 0 ft 1 10 000 000000 Rn:5 Rd:5 | fcvtms {r sf, Rd}, {vs Rn, 2 + ft}
+FCVTMU_int       sf 0 0 11110 0 ft 1 10 001 000000 Rn:5 Rd:5 | fcvtmu {r sf, Rd}, {vs Rn, 2 + ft}
+FCVTZS_int       sf 0 0 11110 0 ft 1 11 000 000000 Rn:5 Rd:5 | fcvtzs {r sf, Rd}, {vs Rn, 2 + ft}
+FCVTZU_int       sf 0 0 11110 0 ft 1 11 001 000000 Rn:5 Rd:5 | fcvtzu {r sf, Rd}, {vs Rn, 2 + ft}
+SCVTF_int        sf 0 0 11110 0 ft 1 00 010 000000 Rn:5 Rd:5 | scvtf {vs Rd, 2 + ft}, {r sf, Rn}
+UCVTF_int        sf 0 0 11110 0 ft 1 00 011 000000 Rn:5 Rd:5 | ucvtf {vs Rd, 2 + ft}, {r sf, Rn}
+FMOV_to_gen      sf 0 0 11110 0 ft 1 00 110 000000 Rn:5 Rd:5 !sf=0,ft=1 !sf=1,ft=0 | fmov {r sf, Rd}, {vs Rn, 2 + ft}
+FMOV_from_gen    sf 0 0 11110 0 ft 1 00 111 000000 Rn:5 Rd:5 !sf=0,ft=1 !sf=1,ft=0 | fmov {vs Rd, 2 + ft}, {r sf, Rn}
+FMOV_to_top      1 0 0 11110 10 1 01 110 000000 Rn:5 Rd:5 | fmov {x Rd}, {vt Rn, "d[1]"}
+FMOV_from_top    1 0 0 11110 10 1 01 111 000000 Rn:5 Rd:5 | fmov {vt Rd, "d[1]"}, {x Rn}
+FJCVTZS          0 0 0 11110 01 1 11 110 000000 Rn:5 Rd:5 @jsconv | fjcvtzs {w Rd}, {vs Rn, 3}
+
+FMOV_reg         0 0 0 11110 0 ft 1 000000 10000 Rn:5 Rd:5 | fmov {vs Rd, 2 + ft}, {vs Rn, 2 + ft}
+FABS             0 0 0 11110 0 ft 1 000001 10000 Rn:5 Rd:5 | fabs {vs Rd, 2 + ft}, {vs Rn, 2 + ft}
+FNEG             0 0 0 11110 0 ft 1 000010 10000 Rn:5 Rd:5 | fneg {vs Rd, 2 + ft}, {vs Rn, 2 + ft}
+FSQRT            0 0 0 11110 0 ft 1 000011 10000 Rn:5 Rd:5 | fsqrt {vs Rd, 2 + ft}, {vs Rn, 2 + ft}
+FRINTN           0 0 0 11110 0 ft 1 001000 10000 Rn:5 Rd:5 | frintn {vs Rd, 2 + ft}, {vs Rn, 2 + ft}
+FRINTP           0 0 0 11110 0 ft 1 001001 10000 Rn:5 Rd:5 | frintp {vs Rd, 2 + ft}, {vs Rn, 2 + ft}
+FRINTM           0 0 0 11110 0 ft 1 001010 10000 Rn:5 Rd:5 | frintm {vs Rd, 2 + ft}, {vs Rn, 2 + ft}
+FRINTZ           0 0 0 11110 0 ft 1 001011 10000 Rn:5 Rd:5 | frintz {vs Rd, 2 + ft}, {vs Rn, 2 + ft}
+FRINTA           0 0 0 11110 0 ft 1 001100 10000 Rn:5 Rd:5 | frinta {vs Rd, 2 + ft}, {vs Rn, 2 + ft}
+FRINTX           0 0 0 11110 0 ft 1 001110 10000 Rn:5 Rd:5 | frintx {vs Rd, 2 + ft}, {vs Rn, 2 + ft}
+FRINTI           0 0 0 11110 0 ft 1 001111 10000 Rn:5 Rd:5 | frinti {vs Rd, 2 + ft}, {vs Rn, 2 + ft}
+FRINT32Z         0 0 0 11110 0 ft 1 010000 10000 Rn:5 Rd:5 @frintts | frint32z {vs Rd, 2 + ft}, {vs Rn, 2 + ft}
+FRINT32X         0 0 0 11110 0 ft 1 010001 10000 Rn:5 Rd:5 @frintts | frint32x {vs Rd, 2 + ft}, {vs Rn, 2 + ft}
+FRINT64Z         0 0 0 11110 0 ft 1 010010 10000 Rn:5 Rd:5 @frintts | frint64z {vs Rd, 2 + ft}, {vs Rn, 2 + ft}
+FRINT64X         0 0 0 11110 0 ft 1 010011 10000 Rn:5 Rd:5 @frintts | frint64x {vs Rd, 2 + ft}, {vs Rn, 2 + ft}
+FCVT             0 0 0 11110 ftype:2 1 0001 opc:2 10000 Rn:5 Rd:5 !ftype=10 !opc=10 ? ftype != opc | fcvt {vs Rd, fpsz(opc)}, {vs Rn, fpsz(ftype)}
+
+FCMP             0 0 0 11110 0 ft 1 Rm:5 00 1000 Rn:5 0 0 000 | fcmp {vs Rn, 2 + ft}, {vs Rm, 2 + ft}
+FCMP_zero        0 0 0 11110 0 ft 1 Rm:5 00 1000 Rn:5 0 1 000 | fcmp {vs Rn, 2 + ft}, #0.0
+FCMPE            0 0 0 11110 0 ft 1 Rm:5 00 1000 Rn:5 1 0 000 | fcmpe {vs Rn, 2 + ft}, {vs Rm, 2 + ft}
+FCMPE_zero       0 0 0 11110 0 ft 1 Rm:5 00 1000 Rn:5 1 1 000 | fcmpe {vs Rn, 2 + ft}, #0.0
+FMOV_imm         0 0 0 11110 0 ft 1 imm8:8 100 00000 Rd:5 | fmov {vs Rd, 2 + ft}, {fimm imm8}
+FCCMP            0 0 0 11110 0 ft 1 Rm:5 cond:4 01 Rn:5 0 nzcv:4 | fccmp {vs Rn, 2 + ft}, {vs Rm, 2 + ft}, {imm nzcv}, {cond cond}
+FCCMPE           0 0 0 11110 0 ft 1 Rm:5 cond:4 01 Rn:5 1 nzcv:4 | fccmpe {vs Rn, 2 + ft}, {vs Rm, 2 + ft}, {imm nzcv}, {cond cond}
+FMUL             0 0 0 11110 0 ft 1 Rm:5 0000 10 Rn:5 Rd:5 | fmul {vs Rd, 2 + ft}, {vs Rn, 2 + ft}, {vs Rm, 2 + ft}
+FDIV             0 0 0 11110 0 ft 1 Rm:5 0001 10 Rn:5 Rd:5 | fdiv {vs Rd, 2 + ft}, {vs Rn, 2 + ft}, {vs Rm, 2 + ft}
+FADD             0 0 0 11110 0 ft 1 Rm:5 0010 10 Rn:5 Rd:5 | fadd {vs Rd, 2 + ft}, {vs Rn, 2 + ft}, {vs Rm, 2 + ft}
+FSUB             0 0 0 11110 0 ft 1 Rm:5 0011 10 Rn:5 Rd:5 | fsub {vs Rd, 2 + ft}, {vs Rn, 2 + ft}, {vs Rm, 2 + ft}
+FMAX             0 0 0 11110 0 ft 1 Rm:5 0100 10 Rn:5 Rd:5 | fmax {vs Rd, 2 + ft}, {vs Rn, 2 + ft}, {vs Rm, 2 + ft}
+FMIN             0 0 0 11110 0 ft 1 Rm:5 0101 10 Rn:5 Rd:5 | fmin {vs Rd, 2 + ft}, {vs Rn, 2 + ft}, {vs Rm, 2 + ft}
+FMAXNM           0 0 0 11110 0 ft 1 Rm:5 0110 10 Rn:5 Rd:5 | fmaxnm {vs Rd, 2 + ft}, {vs Rn, 2 + ft}, {vs Rm, 2 + ft}
+FMINNM           0 0 0 11110 0 ft 1 Rm:5 0111 10 Rn:5 Rd:5 | fminnm {vs Rd, 2 + ft}, {vs Rn, 2 + ft}, {vs Rm, 2 + ft}
+FNMUL            0 0 0 11110 0 ft 1 Rm:5 1000 10 Rn:5 Rd:5 | fnmul {vs Rd, 2 + ft}, {vs Rn, 2 + ft}, {vs Rm, 2 + ft}
+FCSEL            0 0 0 11110 0 ft 1 Rm:5 cond:4 11 Rn:5 Rd:5 | fcsel {vs Rd, 2 + ft}, {vs Rn, 2 + ft}, {vs Rm, 2 + ft}, {cond cond}
+FMADD            0 0 0 11111 0 ft 0 Rm:5 0 Ra:5 Rn:5 Rd:5 | fmadd {vs Rd, 2 + ft}, {vs Rn, 2 + ft}, {vs Rm, 2 + ft}, {vs Ra, 2 + ft}
+FMSUB            0 0 0 11111 0 ft 0 Rm:5 1 Ra:5 Rn:5 Rd:5 | fmsub {vs Rd, 2 + ft}, {vs Rn, 2 + ft}, {vs Rm, 2 + ft}, {vs Ra, 2 + ft}
+FNMADD           0 0 0 11111 0 ft 1 Rm:5 0 Ra:5 Rn:5 Rd:5 | fnmadd {vs Rd, 2 + ft}, {vs Rn, 2 + ft}, {vs Rm, 2 + ft}, {vs Ra, 2 + ft}
+FNMSUB           0 0 0 11111 0 ft 1 Rm:5 1 Ra:5 Rn:5 Rd:5 | fnmsub {vs Rd, 2 + ft}, {vs Rn, 2 + ft}, {vs Rm, 2 + ft}, {vs Ra, 2 + ft}
+
+# ---------------------------------------------------------------- cryptography: AES, SHA1, SHA256 (+crypto; SHA3, SHA512, SM3, SM4 not enabled)
+AESE             01001110 00 10100 00100 10 Rn:5 Rd:5 @aes | aese {vt Rd, "16b"}, {vt Rn, "16b"}
+AESD             01001110 00 10100 00101 10 Rn:5 Rd:5 @aes | aesd {vt Rd, "16b"}, {vt Rn, "16b"}
+AESMC            01001110 00 10100 00110 10 Rn:5 Rd:5 @aes | aesmc {vt Rd, "16b"}, {vt Rn, "16b"}
+AESIMC           01001110 00 10100 00111 10 Rn:5 Rd:5 @aes | aesimc {vt Rd, "16b"}, {vt Rn, "16b"}
+SHA1C            01011110 00 0 Rm:5 0 000 00 Rn:5 Rd:5 @sha2 | sha1c {vs Rd, 4}, {vs Rn, 2}, {vt Rm, "4s"}
+SHA1P            01011110 00 0 Rm:5 0 001 00 Rn:5 Rd:5 @sha2 | sha1p {vs Rd, 4}, {vs Rn, 2}, {vt Rm, "4s"}
+SHA1M            01011110 00 0 Rm:5 0 010 00 Rn:5 Rd:5 @sha2 | sha1m {vs Rd, 4}, {vs Rn, 2}, {vt Rm, "4s"}
+SHA1SU0          01011110 00 0 Rm:5 0 011 00 Rn:5 Rd:5 @sha2 | sha1su0 {vt Rd, "4s"}, {vt Rn, "4s"}, {vt Rm, "4s"}
+SHA256H          01011110 00 0 Rm:5 0 100 00 Rn:5 Rd:5 @sha2 | sha256h {vs Rd, 4}, {vs Rn, 4}, {vt Rm, "4s"}
+SHA256H2         01011110 00 0 Rm:5 0 101 00 Rn:5 Rd:5 @sha2 | sha256h2 {vs Rd, 4}, {vs Rn, 4}, {vt Rm, "4s"}
+SHA256SU1        01011110 00 0 Rm:5 0 110 00 Rn:5 Rd:5 @sha2 | sha256su1 {vt Rd, "4s"}, {vt Rn, "4s"}, {vt Rm, "4s"}
+SHA1H            01011110 00 10100 00000 10 Rn:5 Rd:5 @sha2 | sha1h {vs Rd, 2}, {vs Rn, 2}
+SHA1SU1          01011110 00 10100 00001 10 Rn:5 Rd:5 @sha2 | sha1su1 {vt Rd, "4s"}, {vt Rn, "4s"}
+SHA256SU0        01011110 00 10100 00010 10 Rn:5 Rd:5 @sha2 | sha256su0 {vt Rd, "4s"}, {vt Rn, "4s"}
+
+# ---------------------------------------------------------------- AdvSIMD scalar
+DUP_elem_s       01 0 11110000 imm5:5 0 0000 1 Rn:5 Rd:5 !imm5=x0000 | mov {vs Rd, esz(imm5)}, {ve Rn, esz(imm5), imm5 >> (esz(imm5) + 1)}
+SQADD_s          01 0 11110 size:2 1 Rm:5 00001 1 Rn:5 Rd:5 | sqadd {vs Rd, size}, {vs Rn, size}, {vs Rm, size}
+SQSUB_s          01 0 11110 size:2 1 Rm:5 00101 1 Rn:5 Rd:5 | sqsub {vs Rd, size}, {vs Rn, size}, {vs Rm, size}
+SQSHL_s          01 0 11110 size:2 1 Rm:5 01001 1 Rn:5 Rd:5 | sqshl {vs Rd, size}, {vs Rn, size}, {vs Rm, size}
+SQRSHL_s         01 0 11110 size:2 1 Rm:5 01011 1 Rn:5 Rd:5 | sqrshl {vs Rd, size}, {vs Rn, size}, {vs Rm, size}
+UQADD_s          01 1 11110 size:2 1 Rm:5 00001 1 Rn:5 Rd:5 | uqadd {vs Rd, size}, {vs Rn, size}, {vs Rm, size}
+UQSUB_s          01 1 11110 size:2 1 Rm:5 00101 1 Rn:5 Rd:5 | uqsub {vs Rd, size}, {vs Rn, size}, {vs Rm, size}
+UQSHL_s          01 1 11110 size:2 1 Rm:5 01001 1 Rn:5 Rd:5 | uqshl {vs Rd, size}, {vs Rn, size}, {vs Rm, size}
+UQRSHL_s         01 1 11110 size:2 1 Rm:5 01011 1 Rn:5 Rd:5 | uqrshl {vs Rd, size}, {vs Rn, size}, {vs Rm, size}
+CMGT_s           01 0 11110 11 1 Rm:5 00110 1 Rn:5 Rd:5 | cmgt {vs Rd, 3}, {vs Rn, 3}, {vs Rm, 3}
+CMGE_s           01 0 11110 11 1 Rm:5 00111 1 Rn:5 Rd:5 | cmge {vs Rd, 3}, {vs Rn, 3}, {vs Rm, 3}
+SSHL_s           01 0 11110 11 1 Rm:5 01000 1 Rn:5 Rd:5 | sshl {vs Rd, 3}, {vs Rn, 3}, {vs Rm, 3}
+SRSHL_s          01 0 11110 11 1 Rm:5 01010 1 Rn:5 Rd:5 | srshl {vs Rd, 3}, {vs Rn, 3}, {vs Rm, 3}
+ADD_s            01 0 11110 11 1 Rm:5 10000 1 Rn:5 Rd:5 | add {vs Rd, 3}, {vs Rn, 3}, {vs Rm, 3}
+CMTST_s          01 0 11110 11 1 Rm:5 10001 1 Rn:5 Rd:5 | cmtst {vs Rd, 3}, {vs Rn, 3}, {vs Rm, 3}
+CMHI_s           01 1 11110 11 1 Rm:5 00110 1 Rn:5 Rd:5 | cmhi {vs Rd, 3}, {vs Rn, 3}, {vs Rm, 3}
+CMHS_s           01 1 11110 11 1 Rm:5 00111 1 Rn:5 Rd:5 | cmhs {vs Rd, 3}, {vs Rn, 3}, {vs Rm, 3}
+USHL_s           01 1 11110 11 1 Rm:5 01000 1 Rn:5 Rd:5 | ushl {vs Rd, 3}, {vs Rn, 3}, {vs Rm, 3}
+URSHL_s          01 1 11110 11 1 Rm:5 01010 1 Rn:5 Rd:5 | urshl {vs Rd, 3}, {vs Rn, 3}, {vs Rm, 3}
+SUB_s            01 1 11110 11 1 Rm:5 10000 1 Rn:5 Rd:5 | sub {vs Rd, 3}, {vs Rn, 3}, {vs Rm, 3}
+CMEQ_s           01 1 11110 11 1 Rm:5 10001 1 Rn:5 Rd:5 | cmeq {vs Rd, 3}, {vs Rn, 3}, {vs Rm, 3}
+SQDMULH_s        01 0 11110 size:2 1 Rm:5 10110 1 Rn:5 Rd:5 !size=00 !size=11 | sqdmulh {vs Rd, size}, {vs Rn, size}, {vs Rm, size}
+SQRDMULH_s       01 1 11110 size:2 1 Rm:5 10110 1 Rn:5 Rd:5 !size=00 !size=11 | sqrdmulh {vs Rd, size}, {vs Rn, size}, {vs Rm, size}
+FMULX_s          01 0 11110 0 sz 1 Rm:5 11011 1 Rn:5 Rd:5 | fmulx {vs Rd, 2 + sz}, {vs Rn, 2 + sz}, {vs Rm, 2 + sz}
+FCMEQ_s          01 0 11110 0 sz 1 Rm:5 11100 1 Rn:5 Rd:5 | fcmeq {vs Rd, 2 + sz}, {vs Rn, 2 + sz}, {vs Rm, 2 + sz}
+FRECPS_s         01 0 11110 0 sz 1 Rm:5 11111 1 Rn:5 Rd:5 | frecps {vs Rd, 2 + sz}, {vs Rn, 2 + sz}, {vs Rm, 2 + sz}
+FRSQRTS_s        01 0 11110 1 sz 1 Rm:5 11111 1 Rn:5 Rd:5 | frsqrts {vs Rd, 2 + sz}, {vs Rn, 2 + sz}, {vs Rm, 2 + sz}
+FCMGE_s          01 1 11110 0 sz 1 Rm:5 11100 1 Rn:5 Rd:5 | fcmge {vs Rd, 2 + sz}, {vs Rn, 2 + sz}, {vs Rm, 2 + sz}
+FACGE_s          01 1 11110 0 sz 1 Rm:5 11101 1 Rn:5 Rd:5 | facge {vs Rd, 2 + sz}, {vs Rn, 2 + sz}, {vs Rm, 2 + sz}
+FABD_s           01 1 11110 1 sz 1 Rm:5 11010 1 Rn:5 Rd:5 | fabd {vs Rd, 2 + sz}, {vs Rn, 2 + sz}, {vs Rm, 2 + sz}
+FCMGT_s          01 1 11110 1 sz 1 Rm:5 11100 1 Rn:5 Rd:5 | fcmgt {vs Rd, 2 + sz}, {vs Rn, 2 + sz}, {vs Rm, 2 + sz}
+FACGT_s          01 1 11110 1 sz 1 Rm:5 11101 1 Rn:5 Rd:5 | facgt {vs Rd, 2 + sz}, {vs Rn, 2 + sz}, {vs Rm, 2 + sz}
+SQRDMLAH_s       01 1 11110 size:2 0 Rm:5 1 000 0 1 Rn:5 Rd:5 !size=00 !size=11 @rdm | sqrdmlah {vs Rd, size}, {vs Rn, size}, {vs Rm, size}
+SQRDMLSH_s       01 1 11110 size:2 0 Rm:5 1 000 1 1 Rn:5 Rd:5 !size=00 !size=11 @rdm | sqrdmlsh {vs Rd, size}, {vs Rn, size}, {vs Rm, size}
+SUQADD_s         01 0 11110 size:2 10000 00011 10 Rn:5 Rd:5 | suqadd {vs Rd, size}, {vs Rn, size}
+SQABS_s          01 0 11110 size:2 10000 00111 10 Rn:5 Rd:5 | sqabs {vs Rd, size}, {vs Rn, size}
+USQADD_s         01 1 11110 size:2 10000 00011 10 Rn:5 Rd:5 | usqadd {vs Rd, size}, {vs Rn, size}
+SQNEG_s          01 1 11110 size:2 10000 00111 10 Rn:5 Rd:5 | sqneg {vs Rd, size}, {vs Rn, size}
+CMGT_zero_s      01 0 11110 11 10000 01000 10 Rn:5 Rd:5 | cmgt {vs Rd, 3}, {vs Rn, 3}, #0
+CMEQ_zero_s      01 0 11110 11 10000 01001 10 Rn:5 Rd:5 | cmeq {vs Rd, 3}, {vs Rn, 3}, #0
+CMLT_zero_s      01 0 11110 11 10000 01010 10 Rn:5 Rd:5 | cmlt {vs Rd, 3}, {vs Rn, 3}, #0
+CMGE_zero_s      01 1 11110 11 10000 01000 10 Rn:5 Rd:5 | cmge {vs Rd, 3}, {vs Rn, 3}, #0
+CMLE_zero_s      01 1 11110 11 10000 01001 10 Rn:5 Rd:5 | cmle {vs Rd, 3}, {vs Rn, 3}, #0
+ABS_s            01 0 11110 11 10000 01011 10 Rn:5 Rd:5 | abs {vs Rd, 3}, {vs Rn, 3}
+NEG_s            01 1 11110 11 10000 01011 10 Rn:5 Rd:5 | neg {vs Rd, 3}, {vs Rn, 3}
+SQXTN_s          01 0 11110 size:2 10000 10100 10 Rn:5 Rd:5 !size=11 | sqxtn {vs Rd, size}, {vs Rn, size + 1}
+SQXTUN_s         01 1 11110 size:2 10000 10010 10 Rn:5 Rd:5 !size=11 | sqxtun {vs Rd, size}, {vs Rn, size + 1}
+UQXTN_s          01 1 11110 size:2 10000 10100 10 Rn:5 Rd:5 !size=11 | uqxtn {vs Rd, size}, {vs Rn, size + 1}
+FCVTXN_s         01 1 11110 01 10000 10110 10 Rn:5 Rd:5 | fcvtxn {vs Rd, 2}, {vs Rn, 3}
+FCVTNS_s         01 0 11110 0 sz 10000 11010 10 Rn:5 Rd:5 | fcvtns {vs Rd, 2 + sz}, {vs Rn, 2 + sz}
+FCVTMS_s         01 0 11110 0 sz 10000 11011 10 Rn:5 Rd:5 | fcvtms {vs Rd, 2 + sz}, {vs Rn, 2 + sz}
+FCVTAS_s         01 0 11110 0 sz 10000 11100 10 Rn:5 Rd:5 | fcvtas {vs Rd, 2 + sz}, {vs Rn, 2 + sz}
+SCVTF_s          01 0 11110 0 sz 10000 11101 10 Rn:5 Rd:5 | scvtf {vs Rd, 2 + sz}, {vs Rn, 2 + sz}
+FCMGT_zero_s     01 0 11110 1 sz 10000 01100 10 Rn:5 Rd:5 | fcmgt {vs Rd, 2 + sz}, {vs Rn, 2 + sz}, #0.0
+FCMEQ_zero_s     01 0 11110 1 sz 10000 01101 10 Rn:5 Rd:5 | fcmeq {vs Rd, 2 + sz}, {vs Rn, 2 + sz}, #0.0
+FCMLT_zero_s     01 0 11110 1 sz 10000 01110 10 Rn:5 Rd:5 | fcmlt {vs Rd, 2 + sz}, {vs Rn, 2 + sz}, #0.0
+FCVTPS_s         01 0 11110 1 sz 10000 11010 10 Rn:5 Rd:5 | fcvtps {vs Rd, 2 + sz}, {vs Rn, 2 + sz}
+FCVTZS_s         01 0 11110 1 sz 10000 11011 10 Rn:5 Rd:5 | fcvtzs {vs Rd, 2 + sz}, {vs Rn, 2 + sz}
+FRECPE_s         01 0 11110 1 sz 10000 11101 10 Rn:5 Rd:5 | frecpe {vs Rd, 2 + sz}, {vs Rn, 2 + sz}
+FRECPX_s         01 0 11110 1 sz 10000 11111 10 Rn:5 Rd:5 | frecpx {vs Rd, 2 + sz}, {vs Rn, 2 + sz}
+FCVTNU_s         01 1 11110 0 sz 10000 11010 10 Rn:5 Rd:5 | fcvtnu {vs Rd, 2 + sz}, {vs Rn, 2 + sz}
+FCVTMU_s         01 1 11110 0 sz 10000 11011 10 Rn:5 Rd:5 | fcvtmu {vs Rd, 2 + sz}, {vs Rn, 2 + sz}
+FCVTAU_s         01 1 11110 0 sz 10000 11100 10 Rn:5 Rd:5 | fcvtau {vs Rd, 2 + sz}, {vs Rn, 2 + sz}
+UCVTF_s          01 1 11110 0 sz 10000 11101 10 Rn:5 Rd:5 | ucvtf {vs Rd, 2 + sz}, {vs Rn, 2 + sz}
+FCMGE_zero_s     01 1 11110 1 sz 10000 01100 10 Rn:5 Rd:5 | fcmge {vs Rd, 2 + sz}, {vs Rn, 2 + sz}, #0.0
+FCMLE_zero_s     01 1 11110 1 sz 10000 01101 10 Rn:5 Rd:5 | fcmle {vs Rd, 2 + sz}, {vs Rn, 2 + sz}, #0.0
+FCVTPU_s         01 1 11110 1 sz 10000 11010 10 Rn:5 Rd:5 | fcvtpu {vs Rd, 2 + sz}, {vs Rn, 2 + sz}
+FCVTZU_s         01 1 11110 1 sz 10000 11011 10 Rn:5 Rd:5 | fcvtzu {vs Rd, 2 + sz}, {vs Rn, 2 + sz}
+FRSQRTE_s        01 1 11110 1 sz 10000 11101 10 Rn:5 Rd:5 | frsqrte {vs Rd, 2 + sz}, {vs Rn, 2 + sz}
+ADDP_s           01 0 11110 11 11000 11011 10 Rn:5 Rd:5 | addp {vs Rd, 3}, {vt Rn, "2d"}
+FMAXNMP_s        01 1 11110 0 sz 11000 01100 10 Rn:5 Rd:5 | fmaxnmp {vs Rd, 2 + sz}, {va Rn, 2 + sz, sz}
+FADDP_s          01 1 11110 0 sz 11000 01101 10 Rn:5 Rd:5 | faddp {vs Rd, 2 + sz}, {va Rn, 2 + sz, sz}
+FMAXP_s          01 1 11110 0 sz 11000 01111 10 Rn:5 Rd:5 | fmaxp {vs Rd, 2 + sz}, {va Rn, 2 + sz, sz}
+FMINNMP_s        01 1 11110 1 sz 11000 01100 10 Rn:5 Rd:5 | fminnmp {vs Rd, 2 + sz}, {va Rn, 2 + sz, sz}
+FMINP_s          01 1 11110 1 sz 11000 01111 10 Rn:5 Rd:5 | fminp {vs Rd, 2 + sz}, {va Rn, 2 + sz, sz}
+SQDMLAL_s        01 0 11110 size:2 1 Rm:5 1001 00 Rn:5 Rd:5 !size=00 !size=11 | sqdmlal {vs Rd, size + 1}, {vs Rn, size}, {vs Rm, size}
+SQDMLSL_s        01 0 11110 size:2 1 Rm:5 1011 00 Rn:5 Rd:5 !size=00 !size=11 | sqdmlsl {vs Rd, size + 1}, {vs Rn, size}, {vs Rm, size}
+SQDMULL_s        01 0 11110 size:2 1 Rm:5 1101 00 Rn:5 Rd:5 !size=00 !size=11 | sqdmull {vs Rd, size + 1}, {vs Rn, size}, {vs Rm, size}
+SSHR_s           01 0 111110 1 immhb:6 00000 1 Rn:5 Rd:5 | sshr {vs Rd, 3}, {vs Rn, 3}, {imm 128 - (64|immhb)}
+SSRA_s           01 0 111110 1 immhb:6 00010 1 Rn:5 Rd:5 | ssra {vs Rd, 3}, {vs Rn, 3}, {imm 128 - (64|immhb)}
+SRSHR_s          01 0 111110 1 immhb:6 00100 1 Rn:5 Rd:5 | srshr {vs Rd, 3}, {vs Rn, 3}, {imm 128 - (64|immhb)}
+SRSRA_s          01 0 111110 1 immhb:6 00110 1 Rn:5 Rd:5 | srsra {vs Rd, 3}, {vs Rn, 3}, {imm 128 - (64|immhb)}
+USHR_s           01 1 111110 1 immhb:6 00000 1 Rn:5 Rd:5 | ushr {vs Rd, 3}, {vs Rn, 3}, {imm 128 - (64|immhb)}
+USRA_s           01 1 111110 1 immhb:6 00010 1 Rn:5 Rd:5 | usra {vs Rd, 3}, {vs Rn, 3}, {imm 128 - (64|immhb)}
+URSHR_s          01 1 111110 1 immhb:6 00100 1 Rn:5 Rd:5 | urshr {vs Rd, 3}, {vs Rn, 3}, {imm 128 - (64|immhb)}
+URSRA_s          01 1 111110 1 immhb:6 00110 1 Rn:5 Rd:5 | ursra {vs Rd, 3}, {vs Rn, 3}, {imm 128 - (64|immhb)}
+SRI_s            01 1 111110 1 immhb:6 01000 1 Rn:5 Rd:5 | sri {vs Rd, 3}, {vs Rn, 3}, {imm 128 - (64|immhb)}
+SHL_s            01 0 111110 1 immhb:6 01010 1 Rn:5 Rd:5 | shl {vs Rd, 3}, {vs Rn, 3}, {imm immhb}
+SLI_s            01 1 111110 1 immhb:6 01010 1 Rn:5 Rd:5 | sli {vs Rd, 3}, {vs Rn, 3}, {imm immhb}
+SQSHL_imm_s      01 0 111110 immh:4 immb:3 01110 1 Rn:5 Rd:5 !immh=0000 | sqshl {vs Rd, hsz(immh)}, {vs Rn, hsz(immh)}, {imm (immh << 3|immb) - (8 << hsz(immh))}
+SQSHLU_s         01 1 111110 immh:4 immb:3 01100 1 Rn:5 Rd:5 !immh=0000 | sqshlu {vs Rd, hsz(immh)}, {vs Rn, hsz(immh)}, {imm (immh << 3|immb) - (8 << hsz(immh))}
+UQSHL_imm_s      01 1 111110 immh:4 immb:3 01110 1 Rn:5 Rd:5 !immh=0000 | uqshl {vs Rd, hsz(immh)}, {vs Rn, hsz(immh)}, {imm (immh << 3|immb) - (8 << hsz(immh))}
+SQSHRN_s         01 0 111110 immh:4 immb:3 10010 1 Rn:5 Rd:5 !immh=0000 !immh=1xxx | sqshrn {vs Rd, hsz(immh)}, {vs Rn, hsz(immh) + 1}, {imm (16 << hsz(immh)) - (immh << 3|immb)}
+SQRSHRN_s        01 0 111110 immh:4 immb:3 10011 1 Rn:5 Rd:5 !immh=0000 !immh=1xxx | sqrshrn {vs Rd, hsz(immh)}, {vs Rn, hsz(immh) + 1}, {imm (16 << hsz(immh)) - (immh << 3|immb)}
+SQSHRUN_s        01 1 111110 immh:4 immb:3 10000 1 Rn:5 Rd:5 !immh=0000 !immh=1xxx | sqshrun {vs Rd, hsz(immh)}, {vs Rn, hsz(immh) + 1}, {imm (16 << hsz(immh)) - (immh << 3|immb)}
+SQRSHRUN_s       01 1 111110 immh:4 immb:3 10001 1 Rn:5 Rd:5 !immh=0000 !immh=1xxx | sqrshrun {vs Rd, hsz(immh)}, {vs Rn, hsz(immh) + 1}, {imm (16 << hsz(immh)) - (immh << 3|immb)}
+UQSHRN_s         01 1 111110 immh:4 immb:3 10010 1 Rn:5 Rd:5 !immh=0000 !immh=1xxx | uqshrn {vs Rd, hsz(immh)}, {vs Rn, hsz(immh) + 1}, {imm (16 << hsz(immh)) - (immh << 3|immb)}
+UQRSHRN_s        01 1 111110 immh:4 immb:3 10011 1 Rn:5 Rd:5 !immh=0000 !immh=1xxx | uqrshrn {vs Rd, hsz(immh)}, {vs Rn, hsz(immh) + 1}, {imm (16 << hsz(immh)) - (immh << 3|immb)}
+SCVTF_fix_s      01 0 111110 immh:4 immb:3 11100 1 Rn:5 Rd:5 !immh=00xx | scvtf {vs Rd, hsz(immh)}, {vs Rn, hsz(immh)}, {imm (16 << hsz(immh)) - (immh << 3|immb)}
+UCVTF_fix_s      01 1 111110 immh:4 immb:3 11100 1 Rn:5 Rd:5 !immh=00xx | ucvtf {vs Rd, hsz(immh)}, {vs Rn, hsz(immh)}, {imm (16 << hsz(immh)) - (immh << 3|immb)}
+FCVTZS_fix_s     01 0 111110 immh:4 immb:3 11111 1 Rn:5 Rd:5 !immh=00xx | fcvtzs {vs Rd, hsz(immh)}, {vs Rn, hsz(immh)}, {imm (16 << hsz(immh)) - (immh << 3|immb)}
+FCVTZU_fix_s     01 1 111110 immh:4 immb:3 11111 1 Rn:5 Rd:5 !immh=00xx | fcvtzu {vs Rd, hsz(immh)}, {vs Rn, hsz(immh)}, {imm (16 << hsz(immh)) - (immh << 3|immb)}
+SQDMLAL_si       01 0 11111 size:2 L M Rm:4 0011 H 0 Rn:5 Rd:5 !size=00 !size=11 | sqdmlal {vs Rd, size + 1}, {vs Rn, size}, {ve elreg(size, M, Rm), size, elidx(size, H, L, M)}
+SQDMLSL_si       01 0 11111 size:2 L M Rm:4 0111 H 0 Rn:5 Rd:5 !size=00 !size=11 | sqdmlsl {vs Rd, size + 1}, {vs Rn, size}, {ve elreg(size, M, Rm), size, elidx(size, H, L, M)}
+SQDMULL_si       01 0 11111 size:2 L M Rm:4 1011 H 0 Rn:5 Rd:5 !size=00 !size=11 | sqdmull {vs Rd, size + 1}, {vs Rn, size}, {ve elreg(size, M, Rm), size, elidx(size, H, L, M)}
+SQDMULH_si       01 0 11111 size:2 L M Rm:4 1100 H 0 Rn:5 Rd:5 !size=00 !size=11 | sqdmulh {vs Rd, size}, {vs Rn, size}, {ve elreg(size, M, Rm), size, elidx(size, H, L, M)}
+SQRDMULH_si      01 0 11111 size:2 L M Rm:4 1101 H 0 Rn:5 Rd:5 !size=00 !size=11 | sqrdmulh {vs Rd, size}, {vs Rn, size}, {ve elreg(size, M, Rm), size, elidx(size, H, L, M)}
+SQRDMLAH_si      01 1 11111 size:2 L M Rm:4 1101 H 0 Rn:5 Rd:5 !size=00 !size=11 @rdm | sqrdmlah {vs Rd, size}, {vs Rn, size}, {ve elreg(size, M, Rm), size, elidx(size, H, L, M)}
+SQRDMLSH_si      01 1 11111 size:2 L M Rm:4 1111 H 0 Rn:5 Rd:5 !size=00 !size=11 @rdm | sqrdmlsh {vs Rd, size}, {vs Rn, size}, {ve elreg(size, M, Rm), size, elidx(size, H, L, M)}
+FMLA_si          01 0 11111 1 sz L M Rm:4 0001 H 0 Rn:5 Rd:5 !sz=1,L=1 | fmla {vs Rd, 2 + sz}, {vs Rn, 2 + sz}, {ve M << 4|Rm, 2 + sz, sz ? H : H << 1|L}
+FMLS_si          01 0 11111 1 sz L M Rm:4 0101 H 0 Rn:5 Rd:5 !sz=1,L=1 | fmls {vs Rd, 2 + sz}, {vs Rn, 2 + sz}, {ve M << 4|Rm, 2 + sz, sz ? H : H << 1|L}
+FMUL_si          01 0 11111 1 sz L M Rm:4 1001 H 0 Rn:5 Rd:5 !sz=1,L=1 | fmul {vs Rd, 2 + sz}, {vs Rn, 2 + sz}, {ve M << 4|Rm, 2 + sz, sz ? H : H << 1|L}
+FMULX_si         01 1 11111 1 sz L M Rm:4 1001 H 0 Rn:5 Rd:5 !sz=1,L=1 | fmulx {vs Rd, 2 + sz}, {vs Rn, 2 + sz}, {ve M << 4|Rm, 2 + sz, sz ? H : H << 1|L}
+
+# ---------------------------------------------------------------- AdvSIMD vector
+TBL              0 Q 001110 00 0 Rm:5 0 len:2 0 00 Rn:5 Rd:5 | tbl {va Rd, 0, Q}, {vlt Rn, len + 1, "16b"}, {va Rm, 0, Q}
+TBX              0 Q 001110 00 0 Rm:5 0 len:2 1 00 Rn:5 Rd:5 | tbx {va Rd, 0, Q}, {vlt Rn, len + 1, "16b"}, {va Rm, 0, Q}
+UZP1             0 Q 001110 size:2 0 Rm:5 0 001 10 Rn:5 Rd:5 !size=11,Q=0 | uzp1 {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+TRN1             0 Q 001110 size:2 0 Rm:5 0 010 10 Rn:5 Rd:5 !size=11,Q=0 | trn1 {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+ZIP1             0 Q 001110 size:2 0 Rm:5 0 011 10 Rn:5 Rd:5 !size=11,Q=0 | zip1 {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+UZP2             0 Q 001110 size:2 0 Rm:5 0 101 10 Rn:5 Rd:5 !size=11,Q=0 | uzp2 {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+TRN2             0 Q 001110 size:2 0 Rm:5 0 110 10 Rn:5 Rd:5 !size=11,Q=0 | trn2 {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+ZIP2             0 Q 001110 size:2 0 Rm:5 0 111 10 Rn:5 Rd:5 !size=11,Q=0 | zip2 {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+EXT              0 Q 101110 00 0 Rm:5 0 imm4:4 0 Rn:5 Rd:5 !Q=0,imm4=1xxx | ext {va Rd, 0, Q}, {va Rn, 0, Q}, {va Rm, 0, Q}, {imm imm4}
+
+DUP_elem         0 Q 0 01110000 imm5:5 0 0000 1 Rn:5 Rd:5 !imm5=x0000 !Q=0,imm5=x1000 | dup {va Rd, esz(imm5), Q}, {ve Rn, esz(imm5), imm5 >> (esz(imm5) + 1)}
+DUP_gen          0 Q 0 01110000 imm5:5 0 0001 1 Rn:5 Rd:5 !imm5=x0000 !Q=0,imm5=x1000 | dup {va Rd, esz(imm5), Q}, {r esz(imm5) == 3, Rn}
+SMOV             0 Q 0 01110000 imm5:5 0 0101 1 Rn:5 Rd:5 !imm5=xx000 !Q=0,imm5=xx100 | smov {r Q, Rd}, {ve Rn, esz(imm5), imm5 >> (esz(imm5) + 1)}
+UMOV             0 Q 0 01110000 imm5:5 0 0111 1 Rn:5 Rd:5 !imm5=x0000 !Q=0,imm5=x1000 !Q=1,imm5=xxxx1 !Q=1,imm5=xxx10 !Q=1,imm5=xx100 | umov {r Q, Rd}, {ve Rn, esz(imm5), imm5 >> (esz(imm5) + 1)}
+= esz(imm5) >= 2 | mov {r Q, Rd}, {ve Rn, esz(imm5), imm5 >> (esz(imm5) + 1)}
+INS_gen          0 1 0 01110000 imm5:5 0 0011 1 Rn:5 Rd:5 !imm5=x0000 | mov {ve Rd, esz(imm5), imm5 >> (esz(imm5) + 1)}, {r esz(imm5) == 3, Rn}
+INS_elem         0 1 1 01110000 imm5:5 0 imm4:4 1 Rn:5 Rd:5 !imm5=x0000 | mov {ve Rd, esz(imm5), imm5 >> (esz(imm5) + 1)}, {ve Rn, esz(imm5), imm4 >> esz(imm5)}
+
+# three same (size 11 with Q 0 is the reserved 1D arrangement; "nod" = no doubleword elements at all)
+SHADD            0 Q 0 01110 size:2 1 Rm:5 00000 1 Rn:5 Rd:5 !size=11 | shadd {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+SQADD            0 Q 0 01110 size:2 1 Rm:5 00001 1 Rn:5 Rd:5 !size=11,Q=0 | sqadd {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+SRHADD           0 Q 0 01110 size:2 1 Rm:5 00010 1 Rn:5 Rd:5 !size=11 | srhadd {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+SHSUB            0 Q 0 01110 size:2 1 Rm:5 00100 1 Rn:5 Rd:5 !size=11 | shsub {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+SQSUB            0 Q 0 01110 size:2 1 Rm:5 00101 1 Rn:5 Rd:5 !size=11,Q=0 | sqsub {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+CMGT             0 Q 0 01110 size:2 1 Rm:5 00110 1 Rn:5 Rd:5 !size=11,Q=0 | cmgt {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+CMGE             0 Q 0 01110 size:2 1 Rm:5 00111 1 Rn:5 Rd:5 !size=11,Q=0 | cmge {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+SSHL             0 Q 0 01110 size:2 1 Rm:5 01000 1 Rn:5 Rd:5 !size=11,Q=0 | sshl {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+SQSHL            0 Q 0 01110 size:2 1 Rm:5 01001 1 Rn:5 Rd:5 !size=11,Q=0 | sqshl {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+SRSHL            0 Q 0 01110 size:2 1 Rm:5 01010 1 Rn:5 Rd:5 !size=11,Q=0 | srshl {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+SQRSHL           0 Q 0 01110 size:2 1 Rm:5 01011 1 Rn:5 Rd:5 !size=11,Q=0 | sqrshl {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+SMAX             0 Q 0 01110 size:2 1 Rm:5 01100 1 Rn:5 Rd:5 !size=11 | smax {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+SMIN             0 Q 0 01110 size:2 1 Rm:5 01101 1 Rn:5 Rd:5 !size=11 | smin {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+SABD             0 Q 0 01110 size:2 1 Rm:5 01110 1 Rn:5 Rd:5 !size=11 | sabd {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+SABA             0 Q 0 01110 size:2 1 Rm:5 01111 1 Rn:5 Rd:5 !size=11 | saba {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+ADD              0 Q 0 01110 size:2 1 Rm:5 10000 1 Rn:5 Rd:5 !size=11,Q=0 | add {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+CMTST            0 Q 0 01110 size:2 1 Rm:5 10001 1 Rn:5 Rd:5 !size=11,Q=0 | cmtst {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+MLA              0 Q 0 01110 size:2 1 Rm:5 10010 1 Rn:5 Rd:5 !size=11 | mla {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+MUL              0 Q 0 01110 size:2 1 Rm:5 10011 1 Rn:5 Rd:5 !size=11 | mul {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+SMAXP            0 Q 0 01110 size:2 1 Rm:5 10100 1 Rn:5 Rd:5 !size=11 | smaxp {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+SMINP            0 Q 0 01110 size:2 1 Rm:5 10101 1 Rn:5 Rd:5 !size=11 | sminp {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+SQDMULH          0 Q 0 01110 size:2 1 Rm:5 10110 1 Rn:5 Rd:5 !size=00 !size=11 | sqdmulh {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+ADDP             0 Q 0 01110 size:2 1 Rm:5 10111 1 Rn:5 Rd:5 !size=11,Q=0 | addp {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+UHADD            0 Q 1 01110 size:2 1 Rm:5 00000 1 Rn:5 Rd:5 !size=11 | uhadd {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+UQADD            0 Q 1 01110 size:2 1 Rm:5 00001 1 Rn:5 Rd:5 !size=11,Q=0 | uqadd {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+URHADD           0 Q 1 01110 size:2 1 Rm:5 00010 1 Rn:5 Rd:5 !size=11 | urhadd {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+UHSUB            0 Q 1 01110 size:2 1 Rm:5 00100 1 Rn:5 Rd:5 !size=11 | uhsub {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+UQSUB            0 Q 1 01110 size:2 1 Rm:5 00101 1 Rn:5 Rd:5 !size=11,Q=0 | uqsub {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+CMHI             0 Q 1 01110 size:2 1 Rm:5 00110 1 Rn:5 Rd:5 !size=11,Q=0 | cmhi {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+CMHS             0 Q 1 01110 size:2 1 Rm:5 00111 1 Rn:5 Rd:5 !size=11,Q=0 | cmhs {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+USHL             0 Q 1 01110 size:2 1 Rm:5 01000 1 Rn:5 Rd:5 !size=11,Q=0 | ushl {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+UQSHL            0 Q 1 01110 size:2 1 Rm:5 01001 1 Rn:5 Rd:5 !size=11,Q=0 | uqshl {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+URSHL            0 Q 1 01110 size:2 1 Rm:5 01010 1 Rn:5 Rd:5 !size=11,Q=0 | urshl {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+UQRSHL           0 Q 1 01110 size:2 1 Rm:5 01011 1 Rn:5 Rd:5 !size=11,Q=0 | uqrshl {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+UMAX             0 Q 1 01110 size:2 1 Rm:5 01100 1 Rn:5 Rd:5 !size=11 | umax {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+UMIN             0 Q 1 01110 size:2 1 Rm:5 01101 1 Rn:5 Rd:5 !size=11 | umin {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+UABD             0 Q 1 01110 size:2 1 Rm:5 01110 1 Rn:5 Rd:5 !size=11 | uabd {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+UABA             0 Q 1 01110 size:2 1 Rm:5 01111 1 Rn:5 Rd:5 !size=11 | uaba {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+SUB              0 Q 1 01110 size:2 1 Rm:5 10000 1 Rn:5 Rd:5 !size=11,Q=0 | sub {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+CMEQ             0 Q 1 01110 size:2 1 Rm:5 10001 1 Rn:5 Rd:5 !size=11,Q=0 | cmeq {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+MLS              0 Q 1 01110 size:2 1 Rm:5 10010 1 Rn:5 Rd:5 !size=11 | mls {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+PMUL             0 Q 1 01110 size:2 1 Rm:5 10011 1 Rn:5 Rd:5 !size=01 !size=1x | pmul {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+UMAXP            0 Q 1 01110 size:2 1 Rm:5 10100 1 Rn:5 Rd:5 !size=11 | umaxp {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+UMINP            0 Q 1 01110 size:2 1 Rm:5 10101 1 Rn:5 Rd:5 !size=11 | uminp {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+SQRDMULH         0 Q 1 01110 size:2 1 Rm:5 10110 1 Rn:5 Rd:5 !size=00 !size=11 | sqrdmulh {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+AND_v            0 Q 0 01110 00 1 Rm:5 00011 1 Rn:5 Rd:5 | and {va Rd, 0, Q}, {va Rn, 0, Q}, {va Rm, 0, Q}
+BIC_v            0 Q 0 01110 01 1 Rm:5 00011 1 Rn:5 Rd:5 | bic {va Rd, 0, Q}, {va Rn, 0, Q}, {va Rm, 0, Q}
+ORR_v            0 Q 0 01110 10 1 Rm:5 00011 1 Rn:5 Rd:5 | orr {va Rd, 0, Q}, {va Rn, 0, Q}, {va Rm, 0, Q}
+= Rn == Rm | mov {va Rd, 0, Q}, {va Rn, 0, Q}
+ORN_v            0 Q 0 01110 11 1 Rm:5 00011 1 Rn:5 Rd:5 | orn {va Rd, 0, Q}, {va Rn, 0, Q}, {va Rm, 0, Q}
+EOR_v            0 Q 1 01110 00 1 Rm:5 00011 1 Rn:5 Rd:5 | eor {va Rd, 0, Q}, {va Rn, 0, Q}, {va Rm, 0, Q}
+BSL_v            0 Q 1 01110 01 1 Rm:5 00011 1 Rn:5 Rd:5 | bsl {va Rd, 0, Q}, {va Rn, 0, Q}, {va Rm, 0, Q}
+BIT_v            0 Q 1 01110 10 1 Rm:5 00011 1 Rn:5 Rd:5 | bit {va Rd, 0, Q}, {va Rn, 0, Q}, {va Rm, 0, Q}
+BIF_v            0 Q 1 01110 11 1 Rm:5 00011 1 Rn:5 Rd:5 | bif {va Rd, 0, Q}, {va Rn, 0, Q}, {va Rm, 0, Q}
+FMAXNM_v         0 Q 0 01110 0 sz 1 Rm:5 11 000 1 Rn:5 Rd:5 !sz=1,Q=0 | fmaxnm {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}, {va Rm, 2 + sz, Q}
+FMLA_v           0 Q 0 01110 0 sz 1 Rm:5 11 001 1 Rn:5 Rd:5 !sz=1,Q=0 | fmla {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}, {va Rm, 2 + sz, Q}
+FADD_v           0 Q 0 01110 0 sz 1 Rm:5 11 010 1 Rn:5 Rd:5 !sz=1,Q=0 | fadd {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}, {va Rm, 2 + sz, Q}
+FMULX_v          0 Q 0 01110 0 sz 1 Rm:5 11 011 1 Rn:5 Rd:5 !sz=1,Q=0 | fmulx {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}, {va Rm, 2 + sz, Q}
+FCMEQ_v          0 Q 0 01110 0 sz 1 Rm:5 11 100 1 Rn:5 Rd:5 !sz=1,Q=0 | fcmeq {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}, {va Rm, 2 + sz, Q}
+FMAX_v           0 Q 0 01110 0 sz 1 Rm:5 11 110 1 Rn:5 Rd:5 !sz=1,Q=0 | fmax {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}, {va Rm, 2 + sz, Q}
+FRECPS_v         0 Q 0 01110 0 sz 1 Rm:5 11 111 1 Rn:5 Rd:5 !sz=1,Q=0 | frecps {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}, {va Rm, 2 + sz, Q}
+FMINNM_v         0 Q 0 01110 1 sz 1 Rm:5 11 000 1 Rn:5 Rd:5 !sz=1,Q=0 | fminnm {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}, {va Rm, 2 + sz, Q}
+FMLS_v           0 Q 0 01110 1 sz 1 Rm:5 11 001 1 Rn:5 Rd:5 !sz=1,Q=0 | fmls {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}, {va Rm, 2 + sz, Q}
+FSUB_v           0 Q 0 01110 1 sz 1 Rm:5 11 010 1 Rn:5 Rd:5 !sz=1,Q=0 | fsub {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}, {va Rm, 2 + sz, Q}
+FMIN_v           0 Q 0 01110 1 sz 1 Rm:5 11 110 1 Rn:5 Rd:5 !sz=1,Q=0 | fmin {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}, {va Rm, 2 + sz, Q}
+FRSQRTS_v        0 Q 0 01110 1 sz 1 Rm:5 11 111 1 Rn:5 Rd:5 !sz=1,Q=0 | frsqrts {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}, {va Rm, 2 + sz, Q}
+FMAXNMP_v        0 Q 1 01110 0 sz 1 Rm:5 11 000 1 Rn:5 Rd:5 !sz=1,Q=0 | fmaxnmp {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}, {va Rm, 2 + sz, Q}
+FADDP_v          0 Q 1 01110 0 sz 1 Rm:5 11 010 1 Rn:5 Rd:5 !sz=1,Q=0 | faddp {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}, {va Rm, 2 + sz, Q}
+FMUL_v           0 Q 1 01110 0 sz 1 Rm:5 11 011 1 Rn:5 Rd:5 !sz=1,Q=0 | fmul {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}, {va Rm, 2 + sz, Q}
+FCMGE_v          0 Q 1 01110 0 sz 1 Rm:5 11 100 1 Rn:5 Rd:5 !sz=1,Q=0 | fcmge {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}, {va Rm, 2 + sz, Q}
+FACGE_v          0 Q 1 01110 0 sz 1 Rm:5 11 101 1 Rn:5 Rd:5 !sz=1,Q=0 | facge {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}, {va Rm, 2 + sz, Q}
+FMAXP_v          0 Q 1 01110 0 sz 1 Rm:5 11 110 1 Rn:5 Rd:5 !sz=1,Q=0 | fmaxp {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}, {va Rm, 2 + sz, Q}
+FDIV_v           0 Q 1 01110 0 sz 1 Rm:5 11 111 1 Rn:5 Rd:5 !sz=1,Q=0 | fdiv {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}, {va Rm, 2 + sz, Q}
+FMINNMP_v        0 Q 1 01110 1 sz 1 Rm:5 11 000 1 Rn:5 Rd:5 !sz=1,Q=0 | fminnmp {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}, {va Rm, 2 + sz, Q}
+FABD_v           0 Q 1 01110 1 sz 1 Rm:5 11 010 1 Rn:5 Rd:5 !sz=1,Q=0 | fabd {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}, {va Rm, 2 + sz, Q}
+FCMGT_v          0 Q 1 01110 1 sz 1 Rm:5 11 100 1 Rn:5 Rd:5 !sz=1,Q=0 | fcmgt {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}, {va Rm, 2 + sz, Q}
+FACGT_v          0 Q 1 01110 1 sz 1 Rm:5 11 101 1 Rn:5 Rd:5 !sz=1,Q=0 | facgt {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}, {va Rm, 2 + sz, Q}
+FMINP_v          0 Q 1 01110 1 sz 1 Rm:5 11 110 1 Rn:5 Rd:5 !sz=1,Q=0 | fminp {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}, {va Rm, 2 + sz, Q}
+SDOT             0 Q 0 01110 10 0 Rm:5 1 0010 1 Rn:5 Rd:5 @dotprod | sdot {va Rd, 2, Q}, {va Rn, 0, Q}, {va Rm, 0, Q}
+UDOT             0 Q 1 01110 10 0 Rm:5 1 0010 1 Rn:5 Rd:5 @dotprod | udot {va Rd, 2, Q}, {va Rn, 0, Q}, {va Rm, 0, Q}
+SQRDMLAH_v       0 Q 1 01110 size:2 0 Rm:5 1 000 0 1 Rn:5 Rd:5 !size=00 !size=11 @rdm | sqrdmlah {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+SQRDMLSH_v       0 Q 1 01110 size:2 0 Rm:5 1 000 1 1 Rn:5 Rd:5 !size=00 !size=11 @rdm | sqrdmlsh {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}
+FCMLA            0 Q 1 01110 size:2 0 Rm:5 1 10 rot:2 1 Rn:5 Rd:5 !size=0x !size=11,Q=0 @complxnum | fcmla {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}, {dec rot * 90}
+FCADD            0 Q 1 01110 size:2 0 Rm:5 1 11 rot 0 1 Rn:5 Rd:5 !size=0x !size=11,Q=0 @complxnum | fcadd {va Rd, size, Q}, {va Rn, size, Q}, {va Rm, size, Q}, {dec rot ? 270 : 90}
+
+# two-register miscellaneous
+REV64            0 Q 0 01110 size:2 10000 00000 10 Rn:5 Rd:5 !size=11 | rev64 {va Rd, size, Q}, {va Rn, size, Q}
+REV16_v          0 Q 0 01110 00 10000 00001 10 Rn:5 Rd:5 | rev16 {va Rd, 0, Q}, {va Rn, 0, Q}
+REV32_v          0 Q 1 01110 0 size 10000 00000 10 Rn:5 Rd:5 | rev32 {va Rd, size, Q}, {va Rn, size, Q}
+SADDLP           0 Q 0 01110 size:2 10000 00010 10 Rn:5 Rd:5 !size=11 | saddlp {va Rd, size + 1, Q}, {va Rn, size, Q}
+SADALP           0 Q 0 01110 size:2 10000 00110 10 Rn:5 Rd:5 !size=11 | sadalp {va Rd, size + 1, Q}, {va Rn, size, Q}
+UADDLP           0 Q 1 01110 size:2 10000 00010 10 Rn:5 Rd:5 !size=11 | uaddlp {va Rd, size + 1, Q}, {va Rn, size, Q}
+UADALP           0 Q 1 01110 size:2 10000 00110 10 Rn:5 Rd:5 !size=11 | uadalp {va Rd, size + 1, Q}, {va Rn, size, Q}
+SUQADD           0 Q 0 01110 size:2 10000 00011 10 Rn:5 Rd:5 !size=11,Q=0 | suqadd {va Rd, size, Q}, {va Rn, size, Q}
+CLS_v            0 Q 0 01110 size:2 10000 00100 10 Rn:5 Rd:5 !size=11 | cls {va Rd, size, Q}, {va Rn, size, Q}
+SQABS            0 Q 0 01110 size:2 10000 00111 10 Rn:5 Rd:5 !size=11,Q=0 | sqabs {va Rd, size, Q}, {va Rn, size, Q}
+ABS              0 Q 0 01110 size:2 10000 01011 10 Rn:5 Rd:5 !size=11,Q=0 | abs {va Rd, size, Q}, {va Rn, size, Q}
+USQADD           0 Q 1 01110 size:2 10000 00011 10 Rn:5 Rd:5 !size=11,Q=0 | usqadd {va Rd, size, Q}, {va Rn, size, Q}
+CLZ_v            0 Q 1 01110 size:2 10000 00100 10 Rn:5 Rd:5 !size=11 | clz {va Rd, size, Q}, {va Rn, size, Q}
+SQNEG            0 Q 1 01110 size:2 10000 00111 10 Rn:5 Rd:5 !size=11,Q=0 | sqneg {va Rd, size, Q}, {va Rn, size, Q}
+NEG              0 Q 1 01110 size:2 10000 01011 10 Rn:5 Rd:5 !size=11,Q=0 | neg {va Rd, size, Q}, {va Rn, size, Q}
+CMGT_zero        0 Q 0 01110 size:2 10000 01000 10 Rn:5 Rd:5 !size=11,Q=0 | cmgt {va Rd, size, Q}, {va Rn, size, Q}, #0
+CMEQ_zero        0 Q 0 01110 size:2 10000 01001 10 Rn:5 Rd:5 !size=11,Q=0 | cmeq {va Rd, size, Q}, {va Rn, size, Q}, #0
+CMLT_zero        0 Q 0 01110 size:2 10000 01010 10 Rn:5 Rd:5 !size=11,Q=0 | cmlt {va Rd, size, Q}, {va Rn, size, Q}, #0
+CMGE_zero        0 Q 1 01110 size:2 10000 01000 10 Rn:5 Rd:5 !size=11,Q=0 | cmge {va Rd, size, Q}, {va Rn, size, Q}, #0
+CMLE_zero        0 Q 1 01110 size:2 10000 01001 10 Rn:5 Rd:5 !size=11,Q=0 | cmle {va Rd, size, Q}, {va Rn, size, Q}, #0
+CNT              0 Q 0 01110 00 10000 00101 10 Rn:5 Rd:5 | cnt {va Rd, 0, Q}, {va Rn, 0, Q}
+NOT              0 Q 1 01110 00 10000 00101 10 Rn:5 Rd:5 | mvn {va Rd, 0, Q}, {va Rn, 0, Q}
+RBIT_v           0 Q 1 01110 01 10000 00101 10 Rn:5 Rd:5 | rbit {va Rd, 0, Q}, {va Rn, 0, Q}
+XTN              0 Q 0 01110 size:2 10000 10010 10 Rn:5 Rd:5 !size=11 | xtn{q2 Q} {va Rd, size, Q}, {va Rn, size + 1, 1}
+SQXTN            0 Q 0 01110 size:2 10000 10100 10 Rn:5 Rd:5 !size=11 | sqxtn{q2 Q} {va Rd, size, Q}, {va Rn, size + 1, 1}
+SQXTUN           0 Q 1 01110 size:2 10000 10010 10 Rn:5 Rd:5 !size=11 | sqxtun{q2 Q} {va Rd, size, Q}, {va Rn, size + 1, 1}
+UQXTN            0 Q 1 01110 size:2 10000 10100 10 Rn:5 Rd:5 !size=11 | uqxtn{q2 Q} {va Rd, size, Q}, {va Rn, size + 1, 1}
+SHLL             0 Q 1 01110 size:2 10000 10011 10 Rn:5 Rd:5 !size=11 | shll{q2 Q} {va Rd, size + 1, 1}, {va Rn, size, Q}, {dec 8 << size}
+FCVTN            0 Q 0 01110 0 sz 10000 10110 10 Rn:5 Rd:5 | fcvtn{q2 Q} {va Rd, 1 + sz, Q}, {va Rn, 2 + sz, 1}
+FCVTXN           0 Q 1 01110 0 1 10000 10110 10 Rn:5 Rd:5 | fcvtxn{q2 Q} {va Rd, 2, Q}, {va Rn, 3, 1}
+FCVTL            0 Q 0 01110 0 sz 10000 10111 10 Rn:5 Rd:5 | fcvtl{q2 Q} {va Rd, 2 + sz, 1}, {va Rn, 1 + sz, Q}
+FRINTN_v         0 Q 0 01110 0 sz 10000 11000 10 Rn:5 Rd:5 !sz=1,Q=0 | frintn {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}
+FRINTM_v         0 Q 0 01110 0 sz 10000 11001 10 Rn:5 Rd:5 !sz=1,Q=0 | frintm {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}
+FCVTNS_v         0 Q 0 01110 0 sz 10000 11010 10 Rn:5 Rd:5 !sz=1,Q=0 | fcvtns {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}
+FCVTMS_v         0 Q 0 01110 0 sz 10000 11011 10 Rn:5 Rd:5 !sz=1,Q=0 | fcvtms {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}
+FCVTAS_v         0 Q 0 01110 0 sz 10000 11100 10 Rn:5 Rd:5 !sz=1,Q=0 | fcvtas {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}
+SCVTF_v          0 Q 0 01110 0 sz 10000 11101 10 Rn:5 Rd:5 !sz=1,Q=0 | scvtf {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}
+FRINT32Z_v       0 Q 0 01110 0 sz 10000 11110 10 Rn:5 Rd:5 !sz=1,Q=0 @frintts | frint32z {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}
+FRINT64Z_v       0 Q 0 01110 0 sz 10000 11111 10 Rn:5 Rd:5 !sz=1,Q=0 @frintts | frint64z {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}
+FCMGT_zero_v     0 Q 0 01110 1 sz 10000 01100 10 Rn:5 Rd:5 !sz=1,Q=0 | fcmgt {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}, #0.0
+FCMEQ_zero_v     0 Q 0 01110 1 sz 10000 01101 10 Rn:5 Rd:5 !sz=1,Q=0 | fcmeq {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}, #0.0
+FCMLT_zero_v     0 Q 0 01110 1 sz 10000 01110 10 Rn:5 Rd:5 !sz=1,Q=0 | fcmlt {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}, #0.0
+FABS_v           0 Q 0 01110 1 sz 10000 01111 10 Rn:5 Rd:5 !sz=1,Q=0 | fabs {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}
+FRINTP_v         0 Q 0 01110 1 sz 10000 11000 10 Rn:5 Rd:5 !sz=1,Q=0 | frintp {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}
+FRINTZ_v         0 Q 0 01110 1 sz 10000 11001 10 Rn:5 Rd:5 !sz=1,Q=0 | frintz {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}
+FCVTPS_v         0 Q 0 01110 1 sz 10000 11010 10 Rn:5 Rd:5 !sz=1,Q=0 | fcvtps {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}
+FCVTZS_v         0 Q 0 01110 1 sz 10000 11011 10 Rn:5 Rd:5 !sz=1,Q=0 | fcvtzs {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}
+FRECPE_v         0 Q 0 01110 1 sz 10000 11101 10 Rn:5 Rd:5 !sz=1,Q=0 | frecpe {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}
+FRINTA_v         0 Q 1 01110 0 sz 10000 11000 10 Rn:5 Rd:5 !sz=1,Q=0 | frinta {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}
+FRINTX_v         0 Q 1 01110 0 sz 10000 11001 10 Rn:5 Rd:5 !sz=1,Q=0 | frintx {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}
+FCVTNU_v         0 Q 1 01110 0 sz 10000 11010 10 Rn:5 Rd:5 !sz=1,Q=0 | fcvtnu {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}
+FCVTMU_v         0 Q 1 01110 0 sz 10000 11011 10 Rn:5 Rd:5 !sz=1,Q=0 | fcvtmu {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}
+FCVTAU_v         0 Q 1 01110 0 sz 10000 11100 10 Rn:5 Rd:5 !sz=1,Q=0 | fcvtau {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}
+UCVTF_v          0 Q 1 01110 0 sz 10000 11101 10 Rn:5 Rd:5 !sz=1,Q=0 | ucvtf {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}
+FRINT32X_v       0 Q 1 01110 0 sz 10000 11110 10 Rn:5 Rd:5 !sz=1,Q=0 @frintts | frint32x {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}
+FRINT64X_v       0 Q 1 01110 0 sz 10000 11111 10 Rn:5 Rd:5 !sz=1,Q=0 @frintts | frint64x {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}
+FCMGE_zero_v     0 Q 1 01110 1 sz 10000 01100 10 Rn:5 Rd:5 !sz=1,Q=0 | fcmge {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}, #0.0
+FCMLE_zero_v     0 Q 1 01110 1 sz 10000 01101 10 Rn:5 Rd:5 !sz=1,Q=0 | fcmle {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}, #0.0
+FNEG_v           0 Q 1 01110 1 sz 10000 01111 10 Rn:5 Rd:5 !sz=1,Q=0 | fneg {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}
+FRINTI_v         0 Q 1 01110 1 sz 10000 11001 10 Rn:5 Rd:5 !sz=1,Q=0 | frinti {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}
+FCVTPU_v         0 Q 1 01110 1 sz 10000 11010 10 Rn:5 Rd:5 !sz=1,Q=0 | fcvtpu {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}
+FCVTZU_v         0 Q 1 01110 1 sz 10000 11011 10 Rn:5 Rd:5 !sz=1,Q=0 | fcvtzu {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}
+FRSQRTE_v        0 Q 1 01110 1 sz 10000 11101 10 Rn:5 Rd:5 !sz=1,Q=0 | frsqrte {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}
+FSQRT_v          0 Q 1 01110 1 sz 10000 11111 10 Rn:5 Rd:5 !sz=1,Q=0 | fsqrt {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}
+URECPE           0 Q 0 01110 1 0 10000 11100 10 Rn:5 Rd:5 | urecpe {va Rd, 2, Q}, {va Rn, 2, Q}
+URSQRTE          0 Q 1 01110 1 0 10000 11100 10 Rn:5 Rd:5 | ursqrte {va Rd, 2, Q}, {va Rn, 2, Q}
+
+# across lanes
+SADDLV           0 Q 0 01110 size:2 11000 00011 10 Rn:5 Rd:5 !size=11 !size=10,Q=0 | saddlv {vs Rd, size + 1}, {va Rn, size, Q}
+SMAXV            0 Q 0 01110 size:2 11000 01010 10 Rn:5 Rd:5 !size=11 !size=10,Q=0 | smaxv {vs Rd, size}, {va Rn, size, Q}
+SMINV            0 Q 0 01110 size:2 11000 11010 10 Rn:5 Rd:5 !size=11 !size=10,Q=0 | sminv {vs Rd, size}, {va Rn, size, Q}
+ADDV             0 Q 0 01110 size:2 11000 11011 10 Rn:5 Rd:5 !size=11 !size=10,Q=0 | addv {vs Rd, size}, {va Rn, size, Q}
+UADDLV           0 Q 1 01110 size:2 11000 00011 10 Rn:5 Rd:5 !size=11 !size=10,Q=0 | uaddlv {vs Rd, size + 1}, {va Rn, size, Q}
+UMAXV            0 Q 1 01110 size:2 11000 01010 10 Rn:5 Rd:5 !size=11 !size=10,Q=0 | umaxv {vs Rd, size}, {va Rn, size, Q}
+UMINV            0 Q 1 01110 size:2 11000 11010 10 Rn:5 Rd:5 !size=11 !size=10,Q=0 | uminv {vs Rd, size}, {va Rn, size, Q}
+FMAXNMV          0 1 1 01110 0 0 11000 01100 10 Rn:5 Rd:5 | fmaxnmv {vs Rd, 2}, {vt Rn, "4s"}
+FMAXV            0 1 1 01110 0 0 11000 01111 10 Rn:5 Rd:5 | fmaxv {vs Rd, 2}, {vt Rn, "4s"}
+FMINNMV          0 1 1 01110 1 0 11000 01100 10 Rn:5 Rd:5 | fminnmv {vs Rd, 2}, {vt Rn, "4s"}
+FMINV            0 1 1 01110 1 0 11000 01111 10 Rn:5 Rd:5 | fminv {vs Rd, 2}, {vt Rn, "4s"}
+
+# three different: long (L), wide (W), narrow high half (N)
+SADDL            0 Q 0 01110 size:2 1 Rm:5 0000 00 Rn:5 Rd:5 !size=11 | saddl{q2 Q} {va Rd, size + 1, 1}, {va Rn, size, Q}, {va Rm, size, Q}
+SADDW            0 Q 0 01110 size:2 1 Rm:5 0001 00 Rn:5 Rd:5 !size=11 | saddw{q2 Q} {va Rd, size + 1, 1}, {va Rn, size + 1, 1}, {va Rm, size, Q}
+SSUBL            0 Q 0 01110 size:2 1 Rm:5 0010 00 Rn:5 Rd:5 !size=11 | ssubl{q2 Q} {va Rd, size + 1, 1}, {va Rn, size, Q}, {va Rm, size, Q}
+SSUBW            0 Q 0 01110 size:2 1 Rm:5 0011 00 Rn:5 Rd:5 !size=11 | ssubw{q2 Q} {va Rd, size + 1, 1}, {va Rn, size + 1, 1}, {va Rm, size, Q}
+ADDHN            0 Q 0 01110 size:2 1 Rm:5 0100 00 Rn:5 Rd:5 !size=11 | addhn{q2 Q} {va Rd, size, Q}, {va Rn, size + 1, 1}, {va Rm, size + 1, 1}
+SABAL            0 Q 0 01110 size:2 1 Rm:5 0101 00 Rn:5 Rd:5 !size=11 | sabal{q2 Q} {va Rd, size + 1, 1}, {va Rn, size, Q}, {va Rm, size, Q}
+SUBHN            0 Q 0 01110 size:2 1 Rm:5 0110 00 Rn:5 Rd:5 !size=11 | subhn{q2 Q} {va Rd, size, Q}, {va Rn, size + 1, 1}, {va Rm, size + 1, 1}
+SABDL            0 Q 0 01110 size:2 1 Rm:5 0111 00 Rn:5 Rd:5 !size=11 | sabdl{q2 Q} {va Rd, size + 1, 1}, {va Rn, size, Q}, {va Rm, size, Q}
+SMLAL            0 Q 0 01110 size:2 1 Rm:5 1000 00 Rn:5 Rd:5 !size=11 | smlal{q2 Q} {va Rd, size + 1, 1}, {va Rn, size, Q}, {va Rm, size, Q}
+SQDMLAL          0 Q 0 01110 size:2 1 Rm:5 1001 00 Rn:5 Rd:5 !size=00 !size=11 | sqdmlal{q2 Q} {va Rd, size + 1, 1}, {va Rn, size, Q}, {va Rm, size, Q}
+SMLSL            0 Q 0 01110 size:2 1 Rm:5 1010 00 Rn:5 Rd:5 !size=11 | smlsl{q2 Q} {va Rd, size + 1, 1}, {va Rn, size, Q}, {va Rm, size, Q}
+SQDMLSL          0 Q 0 01110 size:2 1 Rm:5 1011 00 Rn:5 Rd:5 !size=00 !size=11 | sqdmlsl{q2 Q} {va Rd, size + 1, 1}, {va Rn, size, Q}, {va Rm, size, Q}
+SMULL            0 Q 0 01110 size:2 1 Rm:5 1100 00 Rn:5 Rd:5 !size=11 | smull{q2 Q} {va Rd, size + 1, 1}, {va Rn, size, Q}, {va Rm, size, Q}
+SQDMULL          0 Q 0 01110 size:2 1 Rm:5 1101 00 Rn:5 Rd:5 !size=00 !size=11 | sqdmull{q2 Q} {va Rd, size + 1, 1}, {va Rn, size, Q}, {va Rm, size, Q}
+UADDL            0 Q 1 01110 size:2 1 Rm:5 0000 00 Rn:5 Rd:5 !size=11 | uaddl{q2 Q} {va Rd, size + 1, 1}, {va Rn, size, Q}, {va Rm, size, Q}
+UADDW            0 Q 1 01110 size:2 1 Rm:5 0001 00 Rn:5 Rd:5 !size=11 | uaddw{q2 Q} {va Rd, size + 1, 1}, {va Rn, size + 1, 1}, {va Rm, size, Q}
+USUBL            0 Q 1 01110 size:2 1 Rm:5 0010 00 Rn:5 Rd:5 !size=11 | usubl{q2 Q} {va Rd, size + 1, 1}, {va Rn, size, Q}, {va Rm, size, Q}
+USUBW            0 Q 1 01110 size:2 1 Rm:5 0011 00 Rn:5 Rd:5 !size=11 | usubw{q2 Q} {va Rd, size + 1, 1}, {va Rn, size + 1, 1}, {va Rm, size, Q}
+RADDHN           0 Q 1 01110 size:2 1 Rm:5 0100 00 Rn:5 Rd:5 !size=11 | raddhn{q2 Q} {va Rd, size, Q}, {va Rn, size + 1, 1}, {va Rm, size + 1, 1}
+UABAL            0 Q 1 01110 size:2 1 Rm:5 0101 00 Rn:5 Rd:5 !size=11 | uabal{q2 Q} {va Rd, size + 1, 1}, {va Rn, size, Q}, {va Rm, size, Q}
+RSUBHN           0 Q 1 01110 size:2 1 Rm:5 0110 00 Rn:5 Rd:5 !size=11 | rsubhn{q2 Q} {va Rd, size, Q}, {va Rn, size + 1, 1}, {va Rm, size + 1, 1}
+UABDL            0 Q 1 01110 size:2 1 Rm:5 0111 00 Rn:5 Rd:5 !size=11 | uabdl{q2 Q} {va Rd, size + 1, 1}, {va Rn, size, Q}, {va Rm, size, Q}
+UMLAL            0 Q 1 01110 size:2 1 Rm:5 1000 00 Rn:5 Rd:5 !size=11 | umlal{q2 Q} {va Rd, size + 1, 1}, {va Rn, size, Q}, {va Rm, size, Q}
+UMLSL            0 Q 1 01110 size:2 1 Rm:5 1010 00 Rn:5 Rd:5 !size=11 | umlsl{q2 Q} {va Rd, size + 1, 1}, {va Rn, size, Q}, {va Rm, size, Q}
+UMULL            0 Q 1 01110 size:2 1 Rm:5 1100 00 Rn:5 Rd:5 !size=11 | umull{q2 Q} {va Rd, size + 1, 1}, {va Rn, size, Q}, {va Rm, size, Q}
+PMULL            0 Q 0 01110 size:2 1 Rm:5 1110 00 Rn:5 Rd:5 !size=01 !size=10 | pmull{q2 Q} {vt Rd, size ? "1q" : "8h"}, {va Rn, size, Q}, {va Rm, size, Q}
+
+# modified immediate (imm8 = abc:defgh; o2 = 1 is the FP16 FMOV)
+MOVI_32          0 Q 0 0111100000 abc:3 0 sh:2 0 0 1 defgh:5 Rd:5 | movi {va Rd, 2, Q}, {imm abc << 5|defgh}{shift 0, sh * 8}
+ORR_imm_32       0 Q 0 0111100000 abc:3 0 sh:2 1 0 1 defgh:5 Rd:5 | orr {va Rd, 2, Q}, {imm abc << 5|defgh}{shift 0, sh * 8}
+MOVI_16          0 Q 0 0111100000 abc:3 10 sh 0 0 1 defgh:5 Rd:5 | movi {va Rd, 1, Q}, {imm abc << 5|defgh}{shift 0, sh * 8}
+ORR_imm_16       0 Q 0 0111100000 abc:3 10 sh 1 0 1 defgh:5 Rd:5 | orr {va Rd, 1, Q}, {imm abc << 5|defgh}{shift 0, sh * 8}
+MOVI_msl         0 Q 0 0111100000 abc:3 110 sh 0 1 defgh:5 Rd:5 | movi {va Rd, 2, Q}, {imm abc << 5|defgh}, msl #{num 8 << sh}
+MOVI_8           0 Q 0 0111100000 abc:3 1110 0 1 defgh:5 Rd:5 | movi {va Rd, 0, Q}, {imm abc << 5|defgh}
+FMOV_v_s         0 Q 0 0111100000 abc:3 1111 0 1 defgh:5 Rd:5 | fmov {va Rd, 2, Q}, {fimm abc << 5|defgh}
+MVNI_32          0 Q 1 0111100000 abc:3 0 sh:2 0 0 1 defgh:5 Rd:5 | mvni {va Rd, 2, Q}, {imm abc << 5|defgh}{shift 0, sh * 8}
+BIC_imm_32       0 Q 1 0111100000 abc:3 0 sh:2 1 0 1 defgh:5 Rd:5 | bic {va Rd, 2, Q}, {imm abc << 5|defgh}{shift 0, sh * 8}
+MVNI_16          0 Q 1 0111100000 abc:3 10 sh 0 0 1 defgh:5 Rd:5 | mvni {va Rd, 1, Q}, {imm abc << 5|defgh}{shift 0, sh * 8}
+BIC_imm_16       0 Q 1 0111100000 abc:3 10 sh 1 0 1 defgh:5 Rd:5 | bic {va Rd, 1, Q}, {imm abc << 5|defgh}{shift 0, sh * 8}
+MVNI_msl         0 Q 1 0111100000 abc:3 110 sh 0 1 defgh:5 Rd:5 | mvni {va Rd, 2, Q}, {imm abc << 5|defgh}, msl #{num 8 << sh}
+MOVI_64          0 Q 1 0111100000 abc:3 1110 0 1 defgh:5 Rd:5 | movi {vt Rd, "2d"}, {hex016 simd_imm(1, 14, abc << 5|defgh)}
+= Q == 0 | movi {vs Rd, 3}, {hex016 simd_imm(1, 14, abc << 5|defgh)}
+FMOV_v_d         0 1 1 0111100000 abc:3 1111 0 1 defgh:5 Rd:5 | fmov {vt Rd, "2d"}, {fimm abc << 5|defgh}
+
+# shift by immediate (element size from the highest set bit of immh)
+SSHR             0 Q 0 011110 immh:4 immb:3 00000 1 Rn:5 Rd:5 !immh=0000 !Q=0,immh=1xxx | sshr {va Rd, hsz(immh), Q}, {va Rn, hsz(immh), Q}, {imm (16 << hsz(immh)) - (immh << 3|immb)}
+SSRA             0 Q 0 011110 immh:4 immb:3 00010 1 Rn:5 Rd:5 !immh=0000 !Q=0,immh=1xxx | ssra {va Rd, hsz(immh), Q}, {va Rn, hsz(immh), Q}, {imm (16 << hsz(immh)) - (immh << 3|immb)}
+SRSHR            0 Q 0 011110 immh:4 immb:3 00100 1 Rn:5 Rd:5 !immh=0000 !Q=0,immh=1xxx | srshr {va Rd, hsz(immh), Q}, {va Rn, hsz(immh), Q}, {imm (16 << hsz(immh)) - (immh << 3|immb)}
+SRSRA            0 Q 0 011110 immh:4 immb:3 00110 1 Rn:5 Rd:5 !immh=0000 !Q=0,immh=1xxx | srsra {va Rd, hsz(immh), Q}, {va Rn, hsz(immh), Q}, {imm (16 << hsz(immh)) - (immh << 3|immb)}
+USHR             0 Q 1 011110 immh:4 immb:3 00000 1 Rn:5 Rd:5 !immh=0000 !Q=0,immh=1xxx | ushr {va Rd, hsz(immh), Q}, {va Rn, hsz(immh), Q}, {imm (16 << hsz(immh)) - (immh << 3|immb)}
+USRA             0 Q 1 011110 immh:4 immb:3 00010 1 Rn:5 Rd:5 !immh=0000 !Q=0,immh=1xxx | usra {va Rd, hsz(immh), Q}, {va Rn, hsz(immh), Q}, {imm (16 << hsz(immh)) - (immh << 3|immb)}
+URSHR            0 Q 1 011110 immh:4 immb:3 00100 1 Rn:5 Rd:5 !immh=0000 !Q=0,immh=1xxx | urshr {va Rd, hsz(immh), Q}, {va Rn, hsz(immh), Q}, {imm (16 << hsz(immh)) - (immh << 3|immb)}
+URSRA            0 Q 1 011110 immh:4 immb:3 00110 1 Rn:5 Rd:5 !immh=0000 !Q=0,immh=1xxx | ursra {va Rd, hsz(immh), Q}, {va Rn, hsz(immh), Q}, {imm (16 << hsz(immh)) - (immh << 3|immb)}
+SRI              0 Q 1 011110 immh:4 immb:3 01000 1 Rn:5 Rd:5 !immh=0000 !Q=0,immh=1xxx | sri {va Rd, hsz(immh), Q}, {va Rn, hsz(immh), Q}, {imm (16 << hsz(immh)) - (immh << 3|immb)}
+SHL              0 Q 0 011110 immh:4 immb:3 01010 1 Rn:5 Rd:5 !immh=0000 !Q=0,immh=1xxx | shl {va Rd, hsz(immh), Q}, {va Rn, hsz(immh), Q}, {imm (immh << 3|immb) - (8 << hsz(immh))}
+SLI              0 Q 1 011110 immh:4 immb:3 01010 1 Rn:5 Rd:5 !immh=0000 !Q=0,immh=1xxx | sli {va Rd, hsz(immh), Q}, {va Rn, hsz(immh), Q}, {imm (immh << 3|immb) - (8 << hsz(immh))}
+SQSHL_imm        0 Q 0 011110 immh:4 immb:3 01110 1 Rn:5 Rd:5 !immh=0000 !Q=0,immh=1xxx | sqshl {va Rd, hsz(immh), Q}, {va Rn, hsz(immh), Q}, {imm (immh << 3|immb) - (8 << hsz(immh))}
+SQSHLU           0 Q 1 011110 immh:4 immb:3 01100 1 Rn:5 Rd:5 !immh=0000 !Q=0,immh=1xxx | sqshlu {va Rd, hsz(immh), Q}, {va Rn, hsz(immh), Q}, {imm (immh << 3|immb) - (8 << hsz(immh))}
+UQSHL_imm        0 Q 1 011110 immh:4 immb:3 01110 1 Rn:5 Rd:5 !immh=0000 !Q=0,immh=1xxx | uqshl {va Rd, hsz(immh), Q}, {va Rn, hsz(immh), Q}, {imm (immh << 3|immb) - (8 << hsz(immh))}
+SHRN_v           0 Q 0 011110 immh:4 immb:3 10000 1 Rn:5 Rd:5 !immh=0000 !immh=1xxx | shrn{q2 Q} {va Rd, hsz(immh), Q}, {va Rn, hsz(immh) + 1, 1}, {imm (16 << hsz(immh)) - (immh << 3|immb)}
+RSHRN_v          0 Q 0 011110 immh:4 immb:3 10001 1 Rn:5 Rd:5 !immh=0000 !immh=1xxx | rshrn{q2 Q} {va Rd, hsz(immh), Q}, {va Rn, hsz(immh) + 1, 1}, {imm (16 << hsz(immh)) - (immh << 3|immb)}
+SQSHRN_v         0 Q 0 011110 immh:4 immb:3 10010 1 Rn:5 Rd:5 !immh=0000 !immh=1xxx | sqshrn{q2 Q} {va Rd, hsz(immh), Q}, {va Rn, hsz(immh) + 1, 1}, {imm (16 << hsz(immh)) - (immh << 3|immb)}
+SQRSHRN_v        0 Q 0 011110 immh:4 immb:3 10011 1 Rn:5 Rd:5 !immh=0000 !immh=1xxx | sqrshrn{q2 Q} {va Rd, hsz(immh), Q}, {va Rn, hsz(immh) + 1, 1}, {imm (16 << hsz(immh)) - (immh << 3|immb)}
+SQSHRUN_v        0 Q 1 011110 immh:4 immb:3 10000 1 Rn:5 Rd:5 !immh=0000 !immh=1xxx | sqshrun{q2 Q} {va Rd, hsz(immh), Q}, {va Rn, hsz(immh) + 1, 1}, {imm (16 << hsz(immh)) - (immh << 3|immb)}
+SQRSHRUN_v       0 Q 1 011110 immh:4 immb:3 10001 1 Rn:5 Rd:5 !immh=0000 !immh=1xxx | sqrshrun{q2 Q} {va Rd, hsz(immh), Q}, {va Rn, hsz(immh) + 1, 1}, {imm (16 << hsz(immh)) - (immh << 3|immb)}
+UQSHRN_v         0 Q 1 011110 immh:4 immb:3 10010 1 Rn:5 Rd:5 !immh=0000 !immh=1xxx | uqshrn{q2 Q} {va Rd, hsz(immh), Q}, {va Rn, hsz(immh) + 1, 1}, {imm (16 << hsz(immh)) - (immh << 3|immb)}
+UQRSHRN_v        0 Q 1 011110 immh:4 immb:3 10011 1 Rn:5 Rd:5 !immh=0000 !immh=1xxx | uqrshrn{q2 Q} {va Rd, hsz(immh), Q}, {va Rn, hsz(immh) + 1, 1}, {imm (16 << hsz(immh)) - (immh << 3|immb)}
+SSHLL            0 Q 0 011110 immh:4 immb:3 10100 1 Rn:5 Rd:5 !immh=0000 !immh=1xxx | sshll{q2 Q} {va Rd, hsz(immh) + 1, 1}, {va Rn, hsz(immh), Q}, {imm (immh << 3|immb) - (8 << hsz(immh))}
+USHLL            0 Q 1 011110 immh:4 immb:3 10100 1 Rn:5 Rd:5 !immh=0000 !immh=1xxx | ushll{q2 Q} {va Rd, hsz(immh) + 1, 1}, {va Rn, hsz(immh), Q}, {imm (immh << 3|immb) - (8 << hsz(immh))}
+SCVTF_fix_v      0 Q 0 011110 immh:4 immb:3 11100 1 Rn:5 Rd:5 !immh=00xx !Q=0,immh=1xxx | scvtf {va Rd, hsz(immh), Q}, {va Rn, hsz(immh), Q}, {imm (16 << hsz(immh)) - (immh << 3|immb)}
+UCVTF_fix_v      0 Q 1 011110 immh:4 immb:3 11100 1 Rn:5 Rd:5 !immh=00xx !Q=0,immh=1xxx | ucvtf {va Rd, hsz(immh), Q}, {va Rn, hsz(immh), Q}, {imm (16 << hsz(immh)) - (immh << 3|immb)}
+FCVTZS_fix_v     0 Q 0 011110 immh:4 immb:3 11111 1 Rn:5 Rd:5 !immh=00xx !Q=0,immh=1xxx | fcvtzs {va Rd, hsz(immh), Q}, {va Rn, hsz(immh), Q}, {imm (16 << hsz(immh)) - (immh << 3|immb)}
+FCVTZU_fix_v     0 Q 1 011110 immh:4 immb:3 11111 1 Rn:5 Rd:5 !immh=00xx !Q=0,immh=1xxx | fcvtzu {va Rd, hsz(immh), Q}, {va Rn, hsz(immh), Q}, {imm (16 << hsz(immh)) - (immh << 3|immb)}
+
+# vector x indexed element (h: index H:L:M, Rm v0-v15; s: index H:L, Rm M:Rm)
+MLA_ve           0 Q 1 01111 size:2 L M Rm:4 0000 H 0 Rn:5 Rd:5 !size=00 !size=11 | mla {va Rd, size, Q}, {va Rn, size, Q}, {ve elreg(size, M, Rm), size, elidx(size, H, L, M)}
+MLS_ve           0 Q 1 01111 size:2 L M Rm:4 0100 H 0 Rn:5 Rd:5 !size=00 !size=11 | mls {va Rd, size, Q}, {va Rn, size, Q}, {ve elreg(size, M, Rm), size, elidx(size, H, L, M)}
+MUL_ve           0 Q 0 01111 size:2 L M Rm:4 1000 H 0 Rn:5 Rd:5 !size=00 !size=11 | mul {va Rd, size, Q}, {va Rn, size, Q}, {ve elreg(size, M, Rm), size, elidx(size, H, L, M)}
+SQDMULH_ve       0 Q 0 01111 size:2 L M Rm:4 1100 H 0 Rn:5 Rd:5 !size=00 !size=11 | sqdmulh {va Rd, size, Q}, {va Rn, size, Q}, {ve elreg(size, M, Rm), size, elidx(size, H, L, M)}
+SQRDMULH_ve      0 Q 0 01111 size:2 L M Rm:4 1101 H 0 Rn:5 Rd:5 !size=00 !size=11 | sqrdmulh {va Rd, size, Q}, {va Rn, size, Q}, {ve elreg(size, M, Rm), size, elidx(size, H, L, M)}
+SQRDMLAH_ve      0 Q 1 01111 size:2 L M Rm:4 1101 H 0 Rn:5 Rd:5 !size=00 !size=11 @rdm | sqrdmlah {va Rd, size, Q}, {va Rn, size, Q}, {ve elreg(size, M, Rm), size, elidx(size, H, L, M)}
+SQRDMLSH_ve      0 Q 1 01111 size:2 L M Rm:4 1111 H 0 Rn:5 Rd:5 !size=00 !size=11 @rdm | sqrdmlsh {va Rd, size, Q}, {va Rn, size, Q}, {ve elreg(size, M, Rm), size, elidx(size, H, L, M)}
+SMLAL_ve         0 Q 0 01111 size:2 L M Rm:4 0010 H 0 Rn:5 Rd:5 !size=00 !size=11 | smlal{q2 Q} {va Rd, size + 1, 1}, {va Rn, size, Q}, {ve elreg(size, M, Rm), size, elidx(size, H, L, M)}
+SQDMLAL_ve       0 Q 0 01111 size:2 L M Rm:4 0011 H 0 Rn:5 Rd:5 !size=00 !size=11 | sqdmlal{q2 Q} {va Rd, size + 1, 1}, {va Rn, size, Q}, {ve elreg(size, M, Rm), size, elidx(size, H, L, M)}
+SMLSL_ve         0 Q 0 01111 size:2 L M Rm:4 0110 H 0 Rn:5 Rd:5 !size=00 !size=11 | smlsl{q2 Q} {va Rd, size + 1, 1}, {va Rn, size, Q}, {ve elreg(size, M, Rm), size, elidx(size, H, L, M)}
+SQDMLSL_ve       0 Q 0 01111 size:2 L M Rm:4 0111 H 0 Rn:5 Rd:5 !size=00 !size=11 | sqdmlsl{q2 Q} {va Rd, size + 1, 1}, {va Rn, size, Q}, {ve elreg(size, M, Rm), size, elidx(size, H, L, M)}
+SMULL_ve         0 Q 0 01111 size:2 L M Rm:4 1010 H 0 Rn:5 Rd:5 !size=00 !size=11 | smull{q2 Q} {va Rd, size + 1, 1}, {va Rn, size, Q}, {ve elreg(size, M, Rm), size, elidx(size, H, L, M)}
+SQDMULL_ve       0 Q 0 01111 size:2 L M Rm:4 1011 H 0 Rn:5 Rd:5 !size=00 !size=11 | sqdmull{q2 Q} {va Rd, size + 1, 1}, {va Rn, size, Q}, {ve elreg(size, M, Rm), size, elidx(size, H, L, M)}
+UMLAL_ve         0 Q 1 01111 size:2 L M Rm:4 0010 H 0 Rn:5 Rd:5 !size=00 !size=11 | umlal{q2 Q} {va Rd, size + 1, 1}, {va Rn, size, Q}, {ve elreg(size, M, Rm), size, elidx(size, H, L, M)}
+UMLSL_ve         0 Q 1 01111 size:2 L M Rm:4 0110 H 0 Rn:5 Rd:5 !size=00 !size=11 | umlsl{q2 Q} {va Rd, size + 1, 1}, {va Rn, size, Q}, {ve elreg(size, M, Rm), size, elidx(size, H, L, M)}
+UMULL_ve         0 Q 1 01111 size:2 L M Rm:4 1010 H 0 Rn:5 Rd:5 !size=00 !size=11 | umull{q2 Q} {va Rd, size + 1, 1}, {va Rn, size, Q}, {ve elreg(size, M, Rm), size, elidx(size, H, L, M)}
+SDOT_ve          0 Q 0 01111 10 L M Rm:4 1110 H 0 Rn:5 Rd:5 @dotprod | sdot {va Rd, 2, Q}, {va Rn, 0, Q}, {vt M << 4|Rm, "4b"}[{num H << 1|L}]
+UDOT_ve          0 Q 1 01111 10 L M Rm:4 1110 H 0 Rn:5 Rd:5 @dotprod | udot {va Rd, 2, Q}, {va Rn, 0, Q}, {vt M << 4|Rm, "4b"}[{num H << 1|L}]
+FMLA_ve          0 Q 0 01111 1 sz L M Rm:4 0001 H 0 Rn:5 Rd:5 !sz=1,L=1 !sz=1,Q=0 | fmla {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}, {ve M << 4|Rm, 2 + sz, sz ? H : H << 1|L}
+FMLS_ve          0 Q 0 01111 1 sz L M Rm:4 0101 H 0 Rn:5 Rd:5 !sz=1,L=1 !sz=1,Q=0 | fmls {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}, {ve M << 4|Rm, 2 + sz, sz ? H : H << 1|L}
+FMUL_ve          0 Q 0 01111 1 sz L M Rm:4 1001 H 0 Rn:5 Rd:5 !sz=1,L=1 !sz=1,Q=0 | fmul {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}, {ve M << 4|Rm, 2 + sz, sz ? H : H << 1|L}
+FMULX_ve         0 Q 1 01111 1 sz L M Rm:4 1001 H 0 Rn:5 Rd:5 !sz=1,L=1 !sz=1,Q=0 | fmulx {va Rd, 2 + sz, Q}, {va Rn, 2 + sz, Q}, {ve M << 4|Rm, 2 + sz, sz ? H : H << 1|L}
+FCMLA_ve         0 1 1 01111 10 L M Rm:4 0 rot:2 1 H 0 Rn:5 Rd:5 !L=1 @complxnum | fcmla {vt Rd, "4s"}, {vt Rn, "4s"}, {ve M << 4|Rm, 2, H}, {dec rot * 90}
+
+# ---------------------------------------------------------------- AdvSIMD loads and stores
+# multiple structures: opcode 0000 four registers (LD4), 0010 LD1 x4, 0100 LD3, 0110 LD1 x3, 0111 LD1 x1, 1000 LD2, 1010 LD1 x2
+ST1_4            0 Q 0011000 0 000000 0010 size:2 Rn:5 Rt:5 | st1 {vl Rt, 4, size, Q}, [{xsp Rn}]
+ST1_4_post       0 Q 0011001 0 0 Rm:5 0010 size:2 Rn:5 Rt:5 | st1 {vl Rt, 4, size, Q}, [{xsp Rn}], {postinc Rm, 4 * (8 << Q)}
+ST1_3            0 Q 0011000 0 000000 0110 size:2 Rn:5 Rt:5 | st1 {vl Rt, 3, size, Q}, [{xsp Rn}]
+ST1_3_post       0 Q 0011001 0 0 Rm:5 0110 size:2 Rn:5 Rt:5 | st1 {vl Rt, 3, size, Q}, [{xsp Rn}], {postinc Rm, 3 * (8 << Q)}
+ST1_1            0 Q 0011000 0 000000 0111 size:2 Rn:5 Rt:5 | st1 {vl Rt, 1, size, Q}, [{xsp Rn}]
+ST1_1_post       0 Q 0011001 0 0 Rm:5 0111 size:2 Rn:5 Rt:5 | st1 {vl Rt, 1, size, Q}, [{xsp Rn}], {postinc Rm, 1 * (8 << Q)}
+ST1_2            0 Q 0011000 0 000000 1010 size:2 Rn:5 Rt:5 | st1 {vl Rt, 2, size, Q}, [{xsp Rn}]
+ST1_2_post       0 Q 0011001 0 0 Rm:5 1010 size:2 Rn:5 Rt:5 | st1 {vl Rt, 2, size, Q}, [{xsp Rn}], {postinc Rm, 2 * (8 << Q)}
+ST4              0 Q 0011000 0 000000 0000 size:2 Rn:5 Rt:5 !size=11,Q=0 | st4 {vl Rt, 4, size, Q}, [{xsp Rn}]
+ST4_post         0 Q 0011001 0 0 Rm:5 0000 size:2 Rn:5 Rt:5 !size=11,Q=0 | st4 {vl Rt, 4, size, Q}, [{xsp Rn}], {postinc Rm, 4 * (8 << Q)}
+ST3              0 Q 0011000 0 000000 0100 size:2 Rn:5 Rt:5 !size=11,Q=0 | st3 {vl Rt, 3, size, Q}, [{xsp Rn}]
+ST3_post         0 Q 0011001 0 0 Rm:5 0100 size:2 Rn:5 Rt:5 !size=11,Q=0 | st3 {vl Rt, 3, size, Q}, [{xsp Rn}], {postinc Rm, 3 * (8 << Q)}
+ST2              0 Q 0011000 0 000000 1000 size:2 Rn:5 Rt:5 !size=11,Q=0 | st2 {vl Rt, 2, size, Q}, [{xsp Rn}]
+ST2_post         0 Q 0011001 0 0 Rm:5 1000 size:2 Rn:5 Rt:5 !size=11,Q=0 | st2 {vl Rt, 2, size, Q}, [{xsp Rn}], {postinc Rm, 2 * (8 << Q)}
+LD1_4            0 Q 0011000 1 000000 0010 size:2 Rn:5 Rt:5 | ld1 {vl Rt, 4, size, Q}, [{xsp Rn}]
+LD1_4_post       0 Q 0011001 1 0 Rm:5 0010 size:2 Rn:5 Rt:5 | ld1 {vl Rt, 4, size, Q}, [{xsp Rn}], {postinc Rm, 4 * (8 << Q)}
+LD1_3            0 Q 0011000 1 000000 0110 size:2 Rn:5 Rt:5 | ld1 {vl Rt, 3, size, Q}, [{xsp Rn}]
+LD1_3_post       0 Q 0011001 1 0 Rm:5 0110 size:2 Rn:5 Rt:5 | ld1 {vl Rt, 3, size, Q}, [{xsp Rn}], {postinc Rm, 3 * (8 << Q)}
+LD1_1            0 Q 0011000 1 000000 0111 size:2 Rn:5 Rt:5 | ld1 {vl Rt, 1, size, Q}, [{xsp Rn}]
+LD1_1_post       0 Q 0011001 1 0 Rm:5 0111 size:2 Rn:5 Rt:5 | ld1 {vl Rt, 1, size, Q}, [{xsp Rn}], {postinc Rm, 1 * (8 << Q)}
+LD1_2            0 Q 0011000 1 000000 1010 size:2 Rn:5 Rt:5 | ld1 {vl Rt, 2, size, Q}, [{xsp Rn}]
+LD1_2_post       0 Q 0011001 1 0 Rm:5 1010 size:2 Rn:5 Rt:5 | ld1 {vl Rt, 2, size, Q}, [{xsp Rn}], {postinc Rm, 2 * (8 << Q)}
+LD4              0 Q 0011000 1 000000 0000 size:2 Rn:5 Rt:5 !size=11,Q=0 | ld4 {vl Rt, 4, size, Q}, [{xsp Rn}]
+LD4_post         0 Q 0011001 1 0 Rm:5 0000 size:2 Rn:5 Rt:5 !size=11,Q=0 | ld4 {vl Rt, 4, size, Q}, [{xsp Rn}], {postinc Rm, 4 * (8 << Q)}
+LD3              0 Q 0011000 1 000000 0100 size:2 Rn:5 Rt:5 !size=11,Q=0 | ld3 {vl Rt, 3, size, Q}, [{xsp Rn}]
+LD3_post         0 Q 0011001 1 0 Rm:5 0100 size:2 Rn:5 Rt:5 !size=11,Q=0 | ld3 {vl Rt, 3, size, Q}, [{xsp Rn}], {postinc Rm, 3 * (8 << Q)}
+LD2              0 Q 0011000 1 000000 1000 size:2 Rn:5 Rt:5 !size=11,Q=0 | ld2 {vl Rt, 2, size, Q}, [{xsp Rn}]
+LD2_post         0 Q 0011001 1 0 Rm:5 1000 size:2 Rn:5 Rt:5 !size=11,Q=0 | ld2 {vl Rt, 2, size, Q}, [{xsp Rn}], {postinc Rm, 2 * (8 << Q)}
+# single structure: kind 00 b (index Q:S:size), 01 h (Q:S:size<1>), 10 s (size 00, Q:S) or d (size 01, S 0, Q); kind 11 replicates (LDnR)
+ST1_lane         0 Q 0011010 0 0 00000 kind:2 0 S size:2 Rn:5 Rt:5 !kind=11 ? lane_ok(kind, S, size) | st1 {vll Rt, 1, lane_sz(kind, size), lane_idx(kind, Q, S, size)}, [{xsp Rn}]
+ST1_lane_post    0 Q 0011011 0 0 Rm:5 kind:2 0 S size:2 Rn:5 Rt:5 !kind=11 ? lane_ok(kind, S, size) | st1 {vll Rt, 1, lane_sz(kind, size), lane_idx(kind, Q, S, size)}, [{xsp Rn}], {postinc Rm, 1 << lane_sz(kind, size)}
+ST2_lane         0 Q 0011010 0 1 00000 kind:2 0 S size:2 Rn:5 Rt:5 !kind=11 ? lane_ok(kind, S, size) | st2 {vll Rt, 2, lane_sz(kind, size), lane_idx(kind, Q, S, size)}, [{xsp Rn}]
+ST2_lane_post    0 Q 0011011 0 1 Rm:5 kind:2 0 S size:2 Rn:5 Rt:5 !kind=11 ? lane_ok(kind, S, size) | st2 {vll Rt, 2, lane_sz(kind, size), lane_idx(kind, Q, S, size)}, [{xsp Rn}], {postinc Rm, 2 << lane_sz(kind, size)}
+ST3_lane         0 Q 0011010 0 0 00000 kind:2 1 S size:2 Rn:5 Rt:5 !kind=11 ? lane_ok(kind, S, size) | st3 {vll Rt, 3, lane_sz(kind, size), lane_idx(kind, Q, S, size)}, [{xsp Rn}]
+ST3_lane_post    0 Q 0011011 0 0 Rm:5 kind:2 1 S size:2 Rn:5 Rt:5 !kind=11 ? lane_ok(kind, S, size) | st3 {vll Rt, 3, lane_sz(kind, size), lane_idx(kind, Q, S, size)}, [{xsp Rn}], {postinc Rm, 3 << lane_sz(kind, size)}
+ST4_lane         0 Q 0011010 0 1 00000 kind:2 1 S size:2 Rn:5 Rt:5 !kind=11 ? lane_ok(kind, S, size) | st4 {vll Rt, 4, lane_sz(kind, size), lane_idx(kind, Q, S, size)}, [{xsp Rn}]
+ST4_lane_post    0 Q 0011011 0 1 Rm:5 kind:2 1 S size:2 Rn:5 Rt:5 !kind=11 ? lane_ok(kind, S, size) | st4 {vll Rt, 4, lane_sz(kind, size), lane_idx(kind, Q, S, size)}, [{xsp Rn}], {postinc Rm, 4 << lane_sz(kind, size)}
+LD1_lane         0 Q 0011010 1 0 00000 kind:2 0 S size:2 Rn:5 Rt:5 !kind=11 ? lane_ok(kind, S, size) | ld1 {vll Rt, 1, lane_sz(kind, size), lane_idx(kind, Q, S, size)}, [{xsp Rn}]
+LD1_lane_post    0 Q 0011011 1 0 Rm:5 kind:2 0 S size:2 Rn:5 Rt:5 !kind=11 ? lane_ok(kind, S, size) | ld1 {vll Rt, 1, lane_sz(kind, size), lane_idx(kind, Q, S, size)}, [{xsp Rn}], {postinc Rm, 1 << lane_sz(kind, size)}
+LD2_lane         0 Q 0011010 1 1 00000 kind:2 0 S size:2 Rn:5 Rt:5 !kind=11 ? lane_ok(kind, S, size) | ld2 {vll Rt, 2, lane_sz(kind, size), lane_idx(kind, Q, S, size)}, [{xsp Rn}]
+LD2_lane_post    0 Q 0011011 1 1 Rm:5 kind:2 0 S size:2 Rn:5 Rt:5 !kind=11 ? lane_ok(kind, S, size) | ld2 {vll Rt, 2, lane_sz(kind, size), lane_idx(kind, Q, S, size)}, [{xsp Rn}], {postinc Rm, 2 << lane_sz(kind, size)}
+LD3_lane         0 Q 0011010 1 0 00000 kind:2 1 S size:2 Rn:5 Rt:5 !kind=11 ? lane_ok(kind, S, size) | ld3 {vll Rt, 3, lane_sz(kind, size), lane_idx(kind, Q, S, size)}, [{xsp Rn}]
+LD3_lane_post    0 Q 0011011 1 0 Rm:5 kind:2 1 S size:2 Rn:5 Rt:5 !kind=11 ? lane_ok(kind, S, size) | ld3 {vll Rt, 3, lane_sz(kind, size), lane_idx(kind, Q, S, size)}, [{xsp Rn}], {postinc Rm, 3 << lane_sz(kind, size)}
+LD4_lane         0 Q 0011010 1 1 00000 kind:2 1 S size:2 Rn:5 Rt:5 !kind=11 ? lane_ok(kind, S, size) | ld4 {vll Rt, 4, lane_sz(kind, size), lane_idx(kind, Q, S, size)}, [{xsp Rn}]
+LD4_lane_post    0 Q 0011011 1 1 Rm:5 kind:2 1 S size:2 Rn:5 Rt:5 !kind=11 ? lane_ok(kind, S, size) | ld4 {vll Rt, 4, lane_sz(kind, size), lane_idx(kind, Q, S, size)}, [{xsp Rn}], {postinc Rm, 4 << lane_sz(kind, size)}
+LD1R             0 Q 0011010 1 0 00000 11 0 0 size:2 Rn:5 Rt:5 | ld1r {vl Rt, 1, size, Q}, [{xsp Rn}]
+LD1R_post        0 Q 0011011 1 0 Rm:5 11 0 0 size:2 Rn:5 Rt:5 | ld1r {vl Rt, 1, size, Q}, [{xsp Rn}], {postinc Rm, 1 << size}
+LD2R             0 Q 0011010 1 1 00000 11 0 0 size:2 Rn:5 Rt:5 | ld2r {vl Rt, 2, size, Q}, [{xsp Rn}]
+LD2R_post        0 Q 0011011 1 1 Rm:5 11 0 0 size:2 Rn:5 Rt:5 | ld2r {vl Rt, 2, size, Q}, [{xsp Rn}], {postinc Rm, 2 << size}
+LD3R             0 Q 0011010 1 0 00000 11 1 0 size:2 Rn:5 Rt:5 | ld3r {vl Rt, 3, size, Q}, [{xsp Rn}]
+LD3R_post        0 Q 0011011 1 0 Rm:5 11 1 0 size:2 Rn:5 Rt:5 | ld3r {vl Rt, 3, size, Q}, [{xsp Rn}], {postinc Rm, 3 << size}
+LD4R             0 Q 0011010 1 1 00000 11 1 0 size:2 Rn:5 Rt:5 | ld4r {vl Rt, 4, size, Q}, [{xsp Rn}]
+LD4R_post        0 Q 0011011 1 1 Rm:5 11 1 0 size:2 Rn:5 Rt:5 | ld4r {vl Rt, 4, size, Q}, [{xsp Rn}], {postinc Rm, 4 << size}

@@ -1,0 +1,8 @@
+# NVN2 optional entry points resolved by OoT 231.40. Signatures/semantics are
+# unverified: generate diagnostic neutral stubs, never label these as ported.
+# Do not dereference guessed descriptor/conversion arguments.
+nvnTexturePoolWriteDescriptorTableData
+nvnSamplerPoolWriteDescriptorTableData
+nvnCommandBufferConvertCooperativeVectorMatrix
+nvnDeviceGetCooperativeVectorMatrixSize
+nvnDeviceConvertCooperativeVectorMatrix

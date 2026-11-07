@@ -1,0 +1,20 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+// Indirect-dispatch arguments written by the GPU can be garbage (stale or never initialised counters): a wild group count hangs AMD's GPU (Orchid df5b0bf08 does the same for draws).
+// One thread copies the 12 bytes to a scratch slot, zeroed when any dimension is over the device limit or the total over the cap
+layout(local_size_x = 1) in;
+layout(buffer_reference, std430) buffer U3 { uint v[]; };
+layout(push_constant) uniform PC { U3 src; U3 dst; uint maxx, maxy, maxz; float cap; uint mode; uint lim_inst, lim_count; float lim_total; } pc;
+void main() {
+    if (pc.mode == 0u) {   // dispatch: 3 words
+        uint x = pc.src.v[0], y = pc.src.v[1], z = pc.src.v[2];
+        if (x > pc.maxx || y > pc.maxy || z > pc.maxz || float(x) * float(y) * float(z) > pc.cap) { x = 0u; y = 0u; z = 0u; }
+        pc.dst.v[0] = x; pc.dst.v[1] = y; pc.dst.v[2] = z;
+    } else {               // draw (4 words) / indexed draw (5): count, instances, ...; a wild count or instance count is drawn as nothing
+        uint n = pc.mode == 1u ? 4u : 5u;
+        uint c = pc.src.v[0], i = pc.src.v[1];
+        bool bad = c > pc.lim_count || i > pc.lim_inst || float(c) * float(i) > pc.lim_total;
+        for (uint k = 0u; k < n; k++) pc.dst.v[k] = pc.src.v[k];
+        if (bad) { pc.dst.v[0] = 0u; pc.dst.v[1] = 0u; }
+    }
+}

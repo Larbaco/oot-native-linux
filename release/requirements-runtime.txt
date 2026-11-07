@@ -1,0 +1,4 @@
+lz4==4.3.3
+zstandard==0.23.0
+fonttools==4.56.0
+Pillow==11.1.0

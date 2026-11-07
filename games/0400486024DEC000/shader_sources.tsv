@@ -1,0 +1,5 @@
+# Nintendo EPD engine containers, read by tools/epd_shaders.py (docs/SHADERS-EPD.md). bfsha and sarc name files; glob is a pattern over the RomFS; the zstd dictionaries come from Pack/ZsDic.pack.zs.
+# Model/ bfres were swept too: one model holds control-block magic without any shader (coincidence or leftovers, see epd_report.json).
+bfsha	Shader/Model.Product.110.product.Nin_Ounce_NVN2.bfsha.zs	Shader/Foliage.Product.110.product.Nin_Ounce_NVN2.bfsha.zs	Shader/TerrainGround.Product.110.product.Nin_Ounce_NVN2.bfsha.zs	Shader/SceneMaterial.Product.110.product.Nin_Ounce_NVN2.bfsha.zs	Layout2Shader/MergeShader.Product.100.Nin_Ounce_NVN2.bfsha.zs
+sarc	Shader/ApplicationPackage.Nin_Ounce_NVN2.release.sarc.zs	Lib/agl/agl_resource.Nin_Ounce_NVN2.release.sarc.zs	Lib/Terrain/tera_resource.Nin_Ounce_NVN2.release.sarc.zs	Lib/gsys/gsys_resource.Nin_Ounce_NVN2.release.sarc.zs
+glob	Effect/*.Nin_Ounce_NVN2.vsetb.byml.zs
