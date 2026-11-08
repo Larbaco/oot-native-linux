@@ -1,4 +1,5 @@
 // Screenshots (vk_shot.h). PNG from the specification (RFC 2083): IHDR, one IDAT holding a zlib stream of stored deflate blocks (RFC 1950 / 1951), IEND.
+#include "vk_replay.h"
 #include "vk_shot.h"
 #include "vk_tex.h"
 #include "vk_submit.h"
@@ -8,10 +9,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 const char *nxrt_log_path(void);
 
-static uint64_t g_at[64]; static int g_nat; static uint64_t g_every, g_count;
+static uint64_t g_at[64]; static int g_nat; static uint64_t g_every, g_count, g_luma, g_luma_from, g_luma_to = ~0ull;   // g_luma: NXRT_VK_LUMA=<n>
 static char g_dir[1024], g_file[1024]; static int g_window;
 static plat_rwlock_t g_req_lock = PLAT_RWLOCK_INIT; static char g_req[8][1024]; static int g_nreq;   // vks_shot_request (DM_CTL shot): taken in order, one per present
 
@@ -137,8 +141,35 @@ static void shot_path(char *out, size_t n, uint64_t frame, const char *suffix) {
 }
 static int origin_ll(void) { extern int vk_origin_lower_left(void); return vk_origin_lower_left(); }
 
+// NXRT_VK_LUMA=<n>, NXRT_VK_LUMA_FROM/_TO=<present> (diagnostics, flash detection): every n-th present is read back (after the frame's GPU work) and box-averaged to 320x180 RGB8, appended to <shot dir>/luma.bin as
+// {u64 present, 320*180*3 bytes}; the mean R,G,B goes to the log ("luma: present N R G B"). tools/flash-detect.py finds the frames whose brightness jumps against both neighbours
+static void luma_present(const tex_t *t, uint64_t frame, const int crop[4]) {
+    uint8_t *px; int w, h;
+    if (vks_shot_capture(t, crop, origin_ll(), &px, &w, &h)) return;
+    enum { TW = 320, TH = 180 };
+    static uint8_t th[TW * TH * 3]; static FILE *f;
+    double m[3] = {0, 0, 0};
+    for (int y = 0; y < TH; y++) for (int x = 0; x < TW; x++) {
+        int x0 = x * w / TW, x1 = (x + 1) * w / TW, y0 = y * h / TH, y1 = (y + 1) * h / TH; unsigned long a[3] = {0, 0, 0}, n = 0;
+        for (int yy = y0; yy < y1; yy++) for (int xx = x0; xx < x1; xx++) { const uint8_t *q = px + ((size_t)yy * w + xx) * 4; a[0] += q[0]; a[1] += q[1]; a[2] += q[2]; n++; }
+        for (int c = 0; c < 3; c++) { th[(y * TW + x) * 3 + c] = n ? (uint8_t)(a[c] / n) : 0; m[c] += th[(y * TW + x) * 3 + c]; }
+    }
+    free(px);
+    if (!f) { char p[1100]; snprintf(p, sizeof p, "%s" PLAT_SEP "luma.bin", *g_dir ? g_dir : "."); f = fopen(p, "ab"); }
+    if (f) { uint64_t fr = frame; fwrite(&fr, 8, 1, f); fwrite(th, 1, sizeof th, f); fflush(f); }
+    VKLOG("luma: present %llu %.4f %.4f %.4f", (unsigned long long)frame, m[0] / (TW * TH * 255.0), m[1] / (TW * TH * 255.0), m[2] / (TW * TH * 255.0));
+    {   // NXRT_VK_LUMA_PD=<mean>[,<frames>[,<max triggers>]]: a present whose mean brightness is above <mean> (a white-out) starts a pass dump of the next <frames> frames (default 1), at most <max> times (default 4)
+        static double thr = -1; static long pdn = 1; static int maxt = 4, trig;
+        if (thr < 0) { const char *e = getenv("NXRT_VK_LUMA_PD"); thr = e && *e ? atof(e) : 2.0; if (e && strchr(e, ',')) { pdn = atol(strchr(e, ',') + 1); const char *e2 = strchr(strchr(e, ',') + 1, ','); if (e2) maxt = atoi(e2 + 1); } }
+        double mean = (m[0] + m[1] + m[2]) / (3.0 * TW * TH * 255.0);
+        if (mean > thr && trig < maxt) { trig++; vkr_passdump_next(pdn); VKLOG("luma: present %llu is white (mean %.3f): pass dump of the next %ld frame(s) (%d of %d)", (unsigned long long)frame, mean, pdn, trig, maxt); }
+    }
+    { const char *e = getenv("NXRT_VK_LUMA_EXIT"); if (e && atoi(e) && g_luma_to != ~0ull && frame + g_luma > g_luma_to) { VKLOG("luma: last present of the range captured, exiting"); if (f) fclose(f); fflush(NULL); _exit(0); } }   // diagnostics: a bounded run ends itself
+}
+
 void vks_shot_present(const tex_t *t, uint64_t frame, const int crop[4]) {
     int want = 0; char path[1100] = "";
+    if (g_luma && frame % g_luma == 0 && frame >= g_luma_from && frame <= g_luma_to) luma_present(t, frame, crop);
     for (int i = 0; i < g_nat; i++) want |= g_at[i] == frame;
     if (g_every && frame % g_every == 0) want = 1;
     if (*g_file) {
@@ -381,6 +412,9 @@ void vks_shot_init(void) {
     const char *e = getenv("NXRT_VK_SHOT");
     for (const char *q = e; q && *q && g_nat < 64; ) { char *end; unsigned long long v = strtoull(q, &end, 0); if (end == q) break; g_at[g_nat++] = v; q = *end == ',' ? end + 1 : end; }
     if ((e = getenv("NXRT_VK_SHOT_EVERY"))) g_every = strtoull(e, NULL, 0);
+    if ((e = getenv("NXRT_VK_LUMA"))) g_luma = strtoull(e, NULL, 0);
+    if ((e = getenv("NXRT_VK_LUMA_FROM"))) g_luma_from = strtoull(e, NULL, 0);   // only the presents in [FROM, TO]
+    if ((e = getenv("NXRT_VK_LUMA_TO"))) g_luma_to = strtoull(e, NULL, 0);
     if ((e = getenv("NXRT_VK_SHOT_FILE"))) snprintf(g_file, sizeof g_file, "%s", e);
     if ((e = getenv("NXRT_VK_SHOT_DIR"))) { snprintf(g_dir, sizeof g_dir, "%s", e); plat_mkdir(g_dir); }
     g_window = (e = getenv("NXRT_VK_SHOT_WINDOW")) && atoi(e);

@@ -1,4 +1,4 @@
-# OoT Native — Linux x86-64 v0.1.5 (WIP)
+# OoT Native — Linux x86-64 v0.1.6 (WIP)
 
 ## English
 
@@ -15,7 +15,7 @@ OoT Native recompiles **The Legend of Zelda: Ocarina of Time** code locally into
 - Reserve at least **45 GB free** on the build destination's disk. The test build directory used 38 GB.
 - With 2 jobs, measured total build time was about **2h25** and peak memory was **4.5 GB RSS**. This adds the first attempt (35m17s, stopped by a bug that has since been fixed) to the successful resumed build (1h49m54s). The time and memory above were measured with **2 jobs**, the fixed setting of earlier releases, not with the new default. With more jobs the build should finish sooner and use more RAM; no figures were measured for other job counts.
 
-Version 0.1.5 bundles FFmpeg 7.1.1 with dav1d 1.5.1 for AV1 movie decoding. Decoding is enabled by default; set `NXRT_MOVIE_DECODE=0` to use the timed no-image fallback. The exact source tarballs are in the adjacent `oot-native-linux-x86_64-v0.1.5-2026-11-07-thirdparty-source.tar.xz` archive. `TESTER-v0.1.5.md` says whether this version can reuse an existing build or needs a new one, and how to test it.
+Version 0.1.6 bundles FFmpeg 7.1.1 with dav1d 1.5.1 for AV1 movie decoding. Decoding is enabled by default; set `NXRT_MOVIE_DECODE=0` to use the timed no-image fallback. The exact source tarballs are in the adjacent `oot-native-linux-x86_64-v0.1.6-2026-11-08-thirdparty-source.tar.xz` archive. `TESTER-v0.1.6.md` says whether this version can reuse an existing build or needs a new one, and how to test it.
 
 ### Known shader limitation
 
@@ -23,12 +23,12 @@ In the package build, 25 of 41,632 shaders failed translation and 17 failed SPIR
 
 ### Download, verify, and start
 
-Download `oot-native-linux-x86_64-v0.1.5-2026-11-07.tar.xz` and compare `sha256sum` with the SHA-256 published alongside the archive. Then extract and verify the package files:
+Download `oot-native-linux-x86_64-v0.1.6-2026-11-08.tar.xz` and compare `sha256sum` with the SHA-256 published alongside the archive. Then extract and verify the package files:
 
 ```sh
-sha256sum oot-native-linux-x86_64-v0.1.5-2026-11-07.tar.xz
-tar -xf oot-native-linux-x86_64-v0.1.5-2026-11-07.tar.xz
-cd oot-native-linux-x86_64-v0.1.5-2026-11-07
+sha256sum oot-native-linux-x86_64-v0.1.6-2026-11-08.tar.xz
+tar -xf oot-native-linux-x86_64-v0.1.6-2026-11-08.tar.xz
+cd oot-native-linux-x86_64-v0.1.6-2026-11-08
 sha256sum -c SHA256SUMS
 ./oot-native-launcher
 ```
@@ -78,7 +78,7 @@ OoT Native recompila localmente o código de **The Legend of Zelda: Ocarina of T
 - Reserve pelo menos **45 GB livres** no disco da pasta de build. A pasta de teste ocupou 38 GB.
 - No teste com 2 jobs, o tempo total medido foi de aproximadamente **2h25** e o pico de memória foi **4,5 GB RSS**. O tempo soma a primeira tentativa (35m17s, interrompida por uma falha já corrigida) e a retomada bem-sucedida (1h49m54s). O tempo e a memória acima foram medidos com **2 jobs**, a configuração fixa dos releases anteriores, e não com o novo padrão. Com mais jobs a build deve terminar antes e usar mais RAM; não foram medidos números para outras quantidades de jobs.
 
-O v0.1.5 inclui FFmpeg 7.1.1 com dav1d 1.5.1 para decodificar vídeos AV1. A decodificação fica ativa por padrão; defina `NXRT_MOVIE_DECODE=0` para usar o fallback temporizado sem imagem. Os tarballs exatos do código-fonte estão no arquivo adjacente `oot-native-linux-x86_64-v0.1.5-2026-11-07-thirdparty-source.tar.xz`. `TESTER-v0.1.5.md` diz se esta versão pode reutilizar um build existente ou precisa de um novo, e como testá-la.
+O v0.1.6 inclui FFmpeg 7.1.1 com dav1d 1.5.1 para decodificar vídeos AV1. A decodificação fica ativa por padrão; defina `NXRT_MOVIE_DECODE=0` para usar o fallback temporizado sem imagem. Os tarballs exatos do código-fonte estão no arquivo adjacente `oot-native-linux-x86_64-v0.1.6-2026-11-08-thirdparty-source.tar.xz`. `TESTER-v0.1.6.md` diz se esta versão pode reutilizar um build existente ou precisa de um novo, e como testá-la.
 
 ### Limitação conhecida de shaders
 
@@ -86,12 +86,12 @@ No build de referência do pacote, 25 de 41.632 shaders falharam na tradução e
 
 ### Baixar, verificar e iniciar
 
-Baixe `oot-native-linux-x86_64-v0.1.5-2026-11-07.tar.xz` e compare o resultado de `sha256sum` com o SHA-256 publicado junto ao arquivo. Depois extraia e valide os arquivos do pacote:
+Baixe `oot-native-linux-x86_64-v0.1.6-2026-11-08.tar.xz` e compare o resultado de `sha256sum` com o SHA-256 publicado junto ao arquivo. Depois extraia e valide os arquivos do pacote:
 
 ```sh
-sha256sum oot-native-linux-x86_64-v0.1.5-2026-11-07.tar.xz
-tar -xf oot-native-linux-x86_64-v0.1.5-2026-11-07.tar.xz
-cd oot-native-linux-x86_64-v0.1.5-2026-11-07
+sha256sum oot-native-linux-x86_64-v0.1.6-2026-11-08.tar.xz
+tar -xf oot-native-linux-x86_64-v0.1.6-2026-11-08.tar.xz
+cd oot-native-linux-x86_64-v0.1.6-2026-11-08
 sha256sum -c SHA256SUMS
 ./oot-native-launcher
 ```

@@ -2,6 +2,7 @@
 // names them (dmsh_abi.h DMSH_KIND_*); the SPIR-V side is read from the module itself (the SPIR-V specification's physical layout).
 #include "vk_shader.h"
 #include "vk_json.h"
+#include "vk_c0.h"
 #include "vk_hmap.h"
 #include "nxs_rt.h"
 #include <stdio.h>
@@ -14,6 +15,23 @@ static VkDescriptorSetLayout g_empty;
 static uint64_t g_loaded, g_failed;
 static struct { VkBuffer buf; vk_alloc mem; VkDeviceSize used, size; } g_c1;   // the c1 bank (host-visible, written once per shader)
 static vks_shader g_failed_mark;
+
+// The Switch 2 compute bank's tables from the reflection's s2_compute_layout: nubo / nssbo (control +0xb1 / +0xb2), the roots' room when the cache has "roots" (the eight word counts of
+// control +0xa9..+0xb0: tools/s2_ctl_layout.py) and the code's own texture base. NXRT_VK_S2_ROOTS=0: the uniform buffers at 0x10 as before the roots were known; NXRT_VK_S2_CTL_LAYOUT=1: the counts only
+// The eight root-table word counts the cache carries ("roots"), for placing pushed constants (vk_c0.h vkc0_push_to_bank). 0 when the cache has none (older cache) or NXRT_VK_S2_ROOTS=0 (the
+// uniform buffers are back at 0x10 then, so there is no room for the roots)
+int vksh_s2_roots(const struct vj *l, uint8_t out[VKC0_ROOT_TABLES]) {
+    const char *e = getenv("NXRT_VK_S2_ROOTS"); if (e && *e == '0') return 0;
+    const vj *r = vj_get(l, "roots"); if (!r || r->n < VKC0_ROOT_TABLES) return 0;
+    for (int i = 0; i < VKC0_ROOT_TABLES; i++) out[i] = (uint8_t)vj_int(vj_at(r, i), 0);
+    return 1;
+}
+vkc0_parts vksh_s2_c0_parts(const struct vj *l, unsigned nubo, unsigned nssbo) {
+    const char *e = getenv("NXRT_VK_S2_ROOTS"); int legacy = e && *e == '0';   // read at each shader load
+    const vj *r = vj_get(l, "roots"); int rb = -1;
+    if (r && r->n >= VKC0_ROOT_TABLES) { uint8_t rr[VKC0_ROOT_TABLES]; for (int i = 0; i < VKC0_ROOT_TABLES; i++) rr[i] = (uint8_t)vj_int(vj_at(r, i), 0); rb = (int)vkc0_roots_bytes(rr); }
+    return vkc0_derive(nubo, nssbo, rb, (uint32_t)vj_int(vj_get(l, "tex_base"), 0), !getenv("NXRT_VK_S2_CTL_LAYOUT"), legacy);
+}
 
 int vksh_set_of(int stage) { return stage == VKS_CS ? 0 : stage == VKS_VS ? 0 : stage == VKS_FS ? 1 : stage == VKS_GS ? 2 : stage == VKS_TCS ? 3 : 4; }
 VkShaderStageFlagBits vksh_vk_stage(int stage) {
@@ -1044,12 +1062,14 @@ vks_shader *vksh_make(const char *key, const uint8_t *spv, size_t spv_size, cons
     // program's own storage buffers (c0 bytes 272, 336, 352 ...) had no slot and were bound as slot 0. With the counts: a descriptor before 0x10 + 16 * nubo is uniform buffer (off - 0x10) / 16, after it storage buffer (off - base) / 16
     { const vj *s2l = vj_get(j, "s2_compute_layout");
       if (s2l && vj_get(s2l, "nubo") && !getenv("NXRT_VK_S2_OLD_LAYOUT")) {
-        int nubo = vj_int(vj_get(s2l, "nubo"), 0), nssbo = vj_int(vj_get(s2l, "nssbo"), 0); int base = 0x10 + 16 * nubo;
-        { int code_tb = vj_int(vj_get(s2l, "tex_base"), 0), ctl_tb = 0x10 + 16 * (nubo + nssbo), tb = code_tb > ctl_tb && !getenv("NXRT_VK_S2_CTL_LAYOUT") ? code_tb : ctl_tb; base = tb - 16 * nssbo; }   // same rule as s2_tex_base below
+        int nubo = vj_int(vj_get(s2l, "nubo"), 0), nssbo = vj_int(vj_get(s2l, "nssbo"), 0);
+        vkc0_parts cp = vksh_s2_c0_parts(s2l, (unsigned)nubo, (unsigned)nssbo);   // same rule as s2_tex_base below: the roots' room (vk_c0.h) sits between the head and the uniform buffers
+        int base = (int)cp.ssbo_base, ubase = (int)cp.ubo_base;
         for (int i = 0; i < s->nb; i++) if (s->b[i].kind == VKB_SBUF) {
             int off = vj_int(vj_get(vj_get(vj_at(bs, i), "nvn"), "c0_offset"), -1); vks_bind *b = &s->b[i];
             if (off < 0x10 || (off - 0x10) % 16) continue;
-            if (off < base) { b->from_ubo = 1; b->reg = (int16_t)((off - 0x10) / 16); }
+            if (off < ubase) continue;   // inside the root tables: words, not a buffer
+            if (off < base) { b->from_ubo = 1; b->reg = (int16_t)((off - ubase) / 16); }
             else { int r = (off - base) / 16; b->from_ubo = 0; b->reg = (int16_t)(r < nssbo && r < 16 ? r : 16); }   // 16: no slot (the replay keeps 16)
             b->remapped = 1;
         } } }
@@ -1117,9 +1137,9 @@ vks_shader *vksh_make(const char *key, const uint8_t *spv, size_t spv_size, cons
             // The control block's uniform / storage counts (bytes 0xb1 / 0xb2) miss entries some programs keep before the storage table (70 of the 3,967 OoT compute programs, among them the
             // auto exposure pair b9932240 / 3f1e6bf1: 8 more 16-byte entries, so their counter buffer sat past the table and read as address 0). The bank size in the same block (ctl 0xb8, high
             // half) minus its texture / image words and the code's own tex_base agree on where the textures start (3,944 of 3,967); the storage table is the nssbo entries just before them
-            uint32_t nubo = (uint32_t)vj_int(vj_get(s2, "nubo"), 0), nssbo = (uint32_t)vj_int(vj_get(s2, "nssbo"), 0), code_tb = s->s2_tex_base, ctl_tb = 0x10 + 16u * (nubo + nssbo);
-            uint32_t tb = code_tb > ctl_tb && !getenv("NXRT_VK_S2_CTL_LAYOUT") ? code_tb : ctl_tb;
-            s->s2_tex_base = tb; s->s2_ssbo_base = tb - 16u * nssbo; } }
+            vkc0_parts cp = vksh_s2_c0_parts(s2, (unsigned)vj_int(vj_get(s2, "nubo"), 0), (unsigned)vj_int(vj_get(s2, "nssbo"), 0));
+            s->s2_tex_base = cp.tex_base; s->s2_ssbo_base = cp.ssbo_base; s->s2_ubo_base = cp.ubo_base; s->s2_has_roots = (uint8_t)vksh_s2_roots(s2, s->s2_roots); }
+        else s->s2_ubo_base = 0x10; }
     // c1: the bytes nxshader took from the shader's record (its translation job), published beside the reflection
     int has_c1 = 0; for (int i = 0; i < s->nb; i++) has_c1 |= s->b[i].kind == VKB_C1;
     if (has_c1) {

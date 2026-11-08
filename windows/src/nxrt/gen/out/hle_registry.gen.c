@@ -1571,6 +1571,8 @@ NXRT_API void adapter_nvnCommandBufferDownsampleTextureView(NxwGuestCpu *cpu);
 NXRT_API void adapter_nvnTextureWriteTexels(NxwGuestCpu *cpu);
 NXRT_API void adapter_nvnTextureWriteTexelsStrided(NxwGuestCpu *cpu);
 NXRT_API void adapter_nvnTextureFlushTexels(NxwGuestCpu *cpu);
+NXRT_API void adapter_nvnCommandBufferPushComputeConstants(NxwGuestCpu *cpu);
+NXRT_API void adapter_nvnCommandBufferPushComputeConstantsDeferred(NxwGuestCpu *cpu);
 NXRT_API void adapter_nvnBufferBuilderGetDevice(NxwGuestCpu *cpu);
 NXRT_API void adapter_nvnCommandBufferBeginDeviceCommands(NxwGuestCpu *cpu);
 NXRT_API void adapter_nvnCommandBufferBindAccelerationStructure(NxwGuestCpu *cpu);
@@ -1611,8 +1613,6 @@ NXRT_API void adapter_nvnCommandBufferMultiDrawMeshTasksIndirectCount(NxwGuestCp
 NXRT_API void adapter_nvnCommandBufferOverrideSubtileSize(NxwGuestCpu *cpu);
 NXRT_API void adapter_nvnCommandBufferPopDebugGroupCompute(NxwGuestCpu *cpu);
 NXRT_API void adapter_nvnCommandBufferPopDebugGroupGraphics(NxwGuestCpu *cpu);
-NXRT_API void adapter_nvnCommandBufferPushComputeConstants(NxwGuestCpu *cpu);
-NXRT_API void adapter_nvnCommandBufferPushComputeConstantsDeferred(NxwGuestCpu *cpu);
 NXRT_API void adapter_nvnCommandBufferPushDebugGroupCompute(NxwGuestCpu *cpu);
 NXRT_API void adapter_nvnCommandBufferPushDebugGroupGraphics(NxwGuestCpu *cpu);
 NXRT_API void adapter_nvnCommandBufferPushGraphicsConstants(NxwGuestCpu *cpu);
@@ -3436,6 +3436,8 @@ const nxrt_hle_entry nxrt_hle_table[] = {
     {"nvnTextureWriteTexels", NXRT_HLE_NVN, 1, "hle_nvn.c", "NVN entry point", adapter_nvnTextureWriteTexels},
     {"nvnTextureWriteTexelsStrided", NXRT_HLE_NVN, 1, "hle_nvn.c", "NVN entry point", adapter_nvnTextureWriteTexelsStrided},
     {"nvnTextureFlushTexels", NXRT_HLE_NVN, 1, "hle_nvn.c", "NVN entry point", adapter_nvnTextureFlushTexels},
+    {"nvnCommandBufferPushComputeConstants", NXRT_HLE_NVN, 1, "hle_nvn.c", "NVN entry point", adapter_nvnCommandBufferPushComputeConstants},
+    {"nvnCommandBufferPushComputeConstantsDeferred", NXRT_HLE_NVN, 1, "hle_nvn.c", "NVN entry point", adapter_nvnCommandBufferPushComputeConstantsDeferred},
     {"nvnBufferBuilderGetDevice", NXRT_HLE_NVN, 0, "names.txt", "NVN entry point", adapter_nvnBufferBuilderGetDevice},
     {"nvnCommandBufferBeginDeviceCommands", NXRT_HLE_NVN, 0, "names.txt", "NVN entry point", adapter_nvnCommandBufferBeginDeviceCommands},
     {"nvnCommandBufferBindAccelerationStructure", NXRT_HLE_NVN, 0, "names.txt", "NVN entry point", adapter_nvnCommandBufferBindAccelerationStructure},
@@ -3476,8 +3478,6 @@ const nxrt_hle_entry nxrt_hle_table[] = {
     {"nvnCommandBufferOverrideSubtileSize", NXRT_HLE_NVN, 0, "names.txt", "NVN entry point", adapter_nvnCommandBufferOverrideSubtileSize},
     {"nvnCommandBufferPopDebugGroupCompute", NXRT_HLE_NVN, 0, "names.txt", "NVN entry point", adapter_nvnCommandBufferPopDebugGroupCompute},
     {"nvnCommandBufferPopDebugGroupGraphics", NXRT_HLE_NVN, 0, "names.txt", "NVN entry point", adapter_nvnCommandBufferPopDebugGroupGraphics},
-    {"nvnCommandBufferPushComputeConstants", NXRT_HLE_NVN, 0, "names.txt", "NVN entry point", adapter_nvnCommandBufferPushComputeConstants},
-    {"nvnCommandBufferPushComputeConstantsDeferred", NXRT_HLE_NVN, 0, "names.txt", "NVN entry point", adapter_nvnCommandBufferPushComputeConstantsDeferred},
     {"nvnCommandBufferPushDebugGroupCompute", NXRT_HLE_NVN, 0, "names.txt", "NVN entry point", adapter_nvnCommandBufferPushDebugGroupCompute},
     {"nvnCommandBufferPushDebugGroupGraphics", NXRT_HLE_NVN, 0, "names.txt", "NVN entry point", adapter_nvnCommandBufferPushDebugGroupGraphics},
     {"nvnCommandBufferPushGraphicsConstants", NXRT_HLE_NVN, 0, "names.txt", "NVN entry point", adapter_nvnCommandBufferPushGraphicsConstants},

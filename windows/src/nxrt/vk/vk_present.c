@@ -171,7 +171,18 @@ static void sleep_until(uint64_t t) {
 }
 
 // One present: acquire, draw the source (or the test pattern) letterboxed into the swapchain image, submit after the frame's GPU work, present
+// Order of the presents as the present thread draws them (it takes the queue in order, so this is a check, not a fix): the timeline value each present waited for (the GPU work of its frame) must grow; equal = nothing new
+// since the previous present (the same picture again); the same texture twice in a row is counted too
+static _Atomic uint64_t g_ord_back, g_ord_same_val, g_ord_same_tex, g_ord_n;
+void vkp_order_stats(uint64_t *n, uint64_t *back, uint64_t *same_val, uint64_t *same_tex) { *n = atomic_load(&g_ord_n); *back = atomic_load(&g_ord_back); *same_val = atomic_load(&g_ord_same_val); *same_tex = atomic_load(&g_ord_same_tex); }
+static void order_note(const pq_item *it) {
+    static uint64_t lw, ls; atomic_fetch_add(&g_ord_n, 1);
+    if (it->wait_value < lw) atomic_fetch_add(&g_ord_back, 1); else if (it->wait_value == lw && lw) atomic_fetch_add(&g_ord_same_val, 1);
+    if (it->serial && it->serial == ls) atomic_fetch_add(&g_ord_same_tex, 1);
+    if (it->wait_value > lw) lw = it->wait_value; ls = it->serial;
+}
 static int present_one(const pq_item *it) {
+    order_note(it);
     if (g_p.stale || vkw_resize_serial() != g_p.resize_seen) { g_p.resize_seen = vkw_resize_serial(); int r = make_swapchain(); if (r) return r; }
     if (!g_p.sc) return 1;
     frame_t *f = &g_p.fr[g_p.fi]; g_p.fi = (g_p.fi + 1) % NFR;

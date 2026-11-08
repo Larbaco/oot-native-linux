@@ -3470,3 +3470,23 @@ NXRT_API void adapter_nvnTextureFlushTexels(NxwGuestCpu *cpu) {
     h_nvnTextureFlushTexels(a0, a1, a2);
 }
 
+NXRT_API void adapter_nvnCommandBufferPushComputeConstants(NxwGuestCpu *cpu) {
+    uint64_t *x = cpu->x; (void)x;
+    NVNcommandBuffer * a0 = (NVNcommandBuffer *)(uintptr_t)x[0];
+    int a1 = (int)x[1];
+    int a2 = (int)x[2];
+    int a3 = (int)x[3];
+    const void * a4 = (const void *)(uintptr_t)x[4];
+    h_nvnCommandBufferPushComputeConstants(a0, a1, a2, a3, a4);
+}
+
+NXRT_API void adapter_nvnCommandBufferPushComputeConstantsDeferred(NxwGuestCpu *cpu) {
+    uint64_t *x = cpu->x; (void)x;
+    NVNcommandBuffer * a0 = (NVNcommandBuffer *)(uintptr_t)x[0];
+    int a1 = (int)x[1];
+    int a2 = (int)x[2];
+    int a3 = (int)x[3];
+    const void * a4 = (const void *)(uintptr_t)x[4];
+    h_nvnCommandBufferPushComputeConstantsDeferred(a0, a1, a2, a3, a4);
+}
+

@@ -10,7 +10,7 @@ make publish VERSION=X.Y.Z OUT=/disco/grande/oot-release-work            # dry-r
 make e2e DUMP=/caminho/oot.nup [NEG_DUMP=outro-jogo.nup] [BUILD_DIR=dir] [RUN=1] OUT=...   # só local, nunca CI
 ```
 
-Variáveis: `PREV` (pacote `.tar.xz` da release anterior; `none` só com `ALLOW_ABI_BREAK=1`), `PREV_ABI` (baseline de ABI commitado, ex. `release/abi-baseline-v0.1.3.json`; se dado, é a referência e precisa concordar com o `PREV`), `OUT` (nunca `/`,
+Variáveis: `PREV` (pacote `.tar.xz` da release anterior; `none` só com `ALLOW_ABI_BREAK=1`), `PREV_ABI` (baseline de ABI commitado, ex. `release/abi-baseline-v0.1.6.json`; se dado, é a referência e precisa concordar com o `PREV`), `OUT` (nunca `/`,
 `/tmp` ou dentro do repo; pode ficar em `release/local.mk`, ignorado pelo git), `JOBS` (padrão: 90% das threads, a regra única de `oot_native_jobs.py`),
 `ALLOW_ABI_BREAK=1`, `KEEP_WORK=1` (mantém a árvore de trabalho), `MIN_FREE_GB` (padrão 25).
 Toda tarefa pesada roda com `nice -n 19 ionice -c3`.

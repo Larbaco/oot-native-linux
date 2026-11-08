@@ -1574,6 +1574,8 @@ NXRT_API void adapter_nvnCommandBufferDownsampleTextureView(NxwGuestCpu *cpu);
 NXRT_API void adapter_nvnTextureWriteTexels(NxwGuestCpu *cpu);
 NXRT_API void adapter_nvnTextureWriteTexelsStrided(NxwGuestCpu *cpu);
 NXRT_API void adapter_nvnTextureFlushTexels(NxwGuestCpu *cpu);
+NXRT_API void adapter_nvnCommandBufferPushComputeConstants(NxwGuestCpu *cpu);
+NXRT_API void adapter_nvnCommandBufferPushComputeConstantsDeferred(NxwGuestCpu *cpu);
 NXRT_API void adapter_nvnBufferBuilderGetDevice(NxwGuestCpu *cpu);
 NXRT_API void adapter_nvnCommandBufferBeginDeviceCommands(NxwGuestCpu *cpu);
 NXRT_API void adapter_nvnCommandBufferBindAccelerationStructure(NxwGuestCpu *cpu);
@@ -1614,8 +1616,6 @@ NXRT_API void adapter_nvnCommandBufferMultiDrawMeshTasksIndirectCount(NxwGuestCp
 NXRT_API void adapter_nvnCommandBufferOverrideSubtileSize(NxwGuestCpu *cpu);
 NXRT_API void adapter_nvnCommandBufferPopDebugGroupCompute(NxwGuestCpu *cpu);
 NXRT_API void adapter_nvnCommandBufferPopDebugGroupGraphics(NxwGuestCpu *cpu);
-NXRT_API void adapter_nvnCommandBufferPushComputeConstants(NxwGuestCpu *cpu);
-NXRT_API void adapter_nvnCommandBufferPushComputeConstantsDeferred(NxwGuestCpu *cpu);
 NXRT_API void adapter_nvnCommandBufferPushDebugGroupCompute(NxwGuestCpu *cpu);
 NXRT_API void adapter_nvnCommandBufferPushDebugGroupGraphics(NxwGuestCpu *cpu);
 NXRT_API void adapter_nvnCommandBufferPushGraphicsConstants(NxwGuestCpu *cpu);

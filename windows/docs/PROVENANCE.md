@@ -44,6 +44,23 @@ and packages by `release/allowlist.txt`.
   destination `src/nxrt/vk/shaders/fsr_easu.comp` and `fsr_rcas.comp`.
   The release binaries are GPL-3.0-or-later.
 
+## Ampere shader lowering
+
+- The SUATOM lowering for Ampere opcode `0x593` adapts the field validation,
+  operand mapping, and Maxwell SUATOM encoding from zortos293/Lichii commit
+  [`d5b258210436254fc734c8a646bcd60eee96ba1e`](https://github.com/zortos293/Lichii/commit/d5b258210436254fc734c8a646bcd60eee96ba1e),
+  GPL-3.0 (compatible with this project's GPL-3.0-or-later license). Destination:
+  `ampere-lower/shader_recompiler/frontend/ampere/lower_to_maxwell.h`.
+- The ISBEWR register-shadow rule follows zortos293/Lichii commit
+  [`b3284778`](https://github.com/zortos293/Lichii/commit/b3284778) and
+  Djihads80/Eglantine commit
+  [`582ecc45`](https://github.com/Djihads80/Eglantine/commit/582ecc45),
+  GPL-3.0-or-later: ISBEWR's data register is an operand at bits 32-39 and must
+  be included in high-register shadowing. This rule was already present in the
+  base branch; this change makes it directly testable and adds a synthetic
+  regression. Destination: `ampere-lower/shader_recompiler/frontend/ampere/lower_to_maxwell.h`.
+
+## Ports from the upstream project (MIT)
 ## Ports from the upstream project (MIT)
 
 Small, attributed ports of MIT-licensed work from the upstream project credited in the top-level `README.md`, under the licence in `LICENSES/MIT-project.txt`, re-applied by hand to this tree (upstream commit hashes and issues below):

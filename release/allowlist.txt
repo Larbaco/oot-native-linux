@@ -2,7 +2,7 @@
 LEGAL.md
 LICENSE
 README.md
-TESTER-v0.1.5.md
+TESTER-v0.1.6.md
 LICENSES/MIT-project.txt
 docs/DEVELOPING.md
 ampere-lower/LICENSE
@@ -477,6 +477,7 @@ release/requirements-launcher.lock
 release/requirements-runtime.lock
 tests/test_release_pipeline.py
 release/abi-baseline-v0.1.3.json
+release/abi-baseline-v0.1.6.json
 release/publish.sh
 release/publish_check.py
 release/render_docs.py

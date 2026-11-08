@@ -642,16 +642,6 @@ NXRT_API void adapter_nvnCommandBufferPopDebugGroupGraphics(NxwGuestCpu *cpu) {
     cpu->x[0] = cpu->x[1] = 0; memset(cpu->q, 0, 4 * 16);
 }
 
-NXRT_API void adapter_nvnCommandBufferPushComputeConstants(NxwGuestCpu *cpu) {
-    static uint8_t seen; nxrt_stub_log("nvnCommandBufferPushComputeConstants", "names.txt", &seen, cpu);
-    cpu->x[0] = cpu->x[1] = 0; memset(cpu->q, 0, 4 * 16);
-}
-
-NXRT_API void adapter_nvnCommandBufferPushComputeConstantsDeferred(NxwGuestCpu *cpu) {
-    static uint8_t seen; nxrt_stub_log("nvnCommandBufferPushComputeConstantsDeferred", "names.txt", &seen, cpu);
-    cpu->x[0] = cpu->x[1] = 0; memset(cpu->q, 0, 4 * 16);
-}
-
 NXRT_API void adapter_nvnCommandBufferPushDebugGroupCompute(NxwGuestCpu *cpu) {
     static uint8_t seen; nxrt_stub_log("nvnCommandBufferPushDebugGroupCompute", "names.txt", &seen, cpu);
     cpu->x[0] = cpu->x[1] = 0; memset(cpu->q, 0, 4 * 16);

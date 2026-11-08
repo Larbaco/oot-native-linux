@@ -20,6 +20,7 @@ int vkm_addr(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off);   /
 int vkm_use(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off);
 // GPU writes into pool memory are copied back to guest memory once the submission completes (NVN pools are coherent with the CPU)
 void vkm_gpu_wrote(uint64_t addr, uint64_t len);
+void vkm_gpu_wrote_k(uint64_t addr, uint64_t len, const char *key);   // the same, with the key of the shader that wrote (diagnostics: NXRT_VK_ADOPT_SKIP / _ONLY)
 // GPU writes whose bytes the CPU knows (inline uniform updates, fills): guest memory gets the same bytes at completion; data is copied
 void vkm_cpu_also(uint64_t addr, uint64_t len, const void *data, int fill, uint32_t value);
 // Treats [addr, addr + len) as written since its last copy, once per frame and address: for the 64 KiB uniform banks of native programs (the tracker can lose writes there)

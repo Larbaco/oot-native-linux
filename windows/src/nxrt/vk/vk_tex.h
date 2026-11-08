@@ -49,6 +49,17 @@ void vkt_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
 vkt_image *vkt_resolve(const tex_t *t);
 VkImageView vkt_view(vkt_image *im, const view_t *v, int set_swz, uint16_t swz);   // NULL view = the default; fallbacks apply (vkf_view_format)
 VkSampler vkt_sampler(const samp_par *p);
+// P3 / N1: the sampler for the image it is bound with (the comparison off when the image has no depth aspect; NXRT_VK_COMPARE_FIX=0: always p). The pieces are pure, for the unit test
+VkSampler vkt_sampler_for(const samp_par *p, const vkt_image *im);
+int vkt_samp_for_aspect(const samp_par *p, VkImageAspectFlags aspect, samp_par *out);
+int vkt_compare_fix_enabled(void);
+int vkt_cmpfix_first(const samp_par *p, int nvn_format);
+uint64_t vkt_cmpfix_count(void);
+VkCompareOp vkt_cmp_op(uint8_t nvn_compare_func);
+samp_par vkt_samp_key(const samp_par *p);   // the sampler cache's key
+int vkt_compare_fix_parse(const char *env_value);
+int vkt_cmp_needs_twin(int shader_depth_compare, VkImageAspectFlags image_aspect);
+VkImageAspectFlags vkt_sample_aspect(VkImageAspectFlags image_aspect, int set_dsmode, int dsmode);
 typedef struct { tex_t t; view_t v; uint8_t has_view, image, live, gone; } vkt_reg;
 // The replay's views of exact parameters: identity swizzle unless m is given (attachments and storage images must have it), cached with the image's views
 VkImageView vkt_view_raw_(vkt_image *im, VkFormat f, VkImageViewType vt, uint32_t base_level, uint32_t nlevels, uint32_t base_layer, uint32_t nlayers, VkImageAspectFlags aspect, const VkComponentMapping *m);

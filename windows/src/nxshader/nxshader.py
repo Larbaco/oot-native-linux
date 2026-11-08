@@ -22,7 +22,7 @@ import nxs_front as F, nxs_spv as S, nxs_refl as R, nxs_cache as C
 REPO = os.path.normpath(os.path.join(HERE, '..', '..'))
 WORK = os.path.normpath(os.path.join(REPO, '..'))
 DEFAULT_CACHE = os.path.join(REPO, '_local', 'nxshader', 'cache')
-# the installer: this tree's parent inside pokopia-native (windows/ beside nxs2.py), else the sibling folder of the private layout
+# the installer: this tree's parent inside the upstream project (windows/ beside nxs2.py), else the sibling folder of the private layout
 DEFAULT_INSTALLER = WORK if os.path.exists(os.path.join(WORK, 'nxs2.py')) else os.path.join(WORK, 'installer')
 def translator_candidates(installer):
     """Where the built dmsh_xlate (dmsh_xlate.dll + its siblings) can be, best first. The tree ships no prebuilt copy: `nxs2.py setup` builds it from
@@ -43,7 +43,7 @@ def find_translator(installer):
              'or point at an existing build with --xlate <folder> (or NXS2_BIN=<folder>). Looked in:\n' + ''.join('    ' + d + '\n' for d in cands))
 
 
-FRONT_VERSION = 2   # nxs_front.py's job building and the integer-input rule (2: uses inside functions only)
+FRONT_VERSION = 4   # 4: invalidate prior shader-cache entries after adding Ampere SUATOM lowering
 BELOW_NORMAL = 0x00004000
 
 

@@ -2108,4 +2108,23 @@ int nvn_host_signal_sync(void *nvnsync) {
 }
 NVN(nvnTextureFlushTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r) { (void)t; (void)v; (void)r; }   // unified memory + dirty page tracking: nothing to flush
 
+// ---------- Root-table constants (P3b) ----------
+// void nvnCommandBufferPushComputeConstants(NVNcommandBuffer *cmd, int table, int offset, int bytes, const void *data) (NVN 2, no prototype in nvn.h): writes bytes at byte offset of root table
+// `table` of the compute pipeline; the dispatches after it read the words in their c0 bank at the table's place (vk_c0.h). The driver clamps bytes to 0x100 and drops calls under 4 bytes; it
+// writes whole words. It is recorded as OP_PUSH_CONST so the replay applies it in order with the dispatches (it is not a write at call time). The Deferred entry point takes the same five
+// arguments but keeps only the data pointer and the low byte of offset: the words are read when the list is replayed (the game may fill them after recording, as for BindTexturesDeferred).
+// The graphics twins stay stubs (their table 0 is a graphics constant bank no replayed program reads yet)
+static void push_compute(NVNcommandBuffer *c, int table, int offset, int bytes, const void *data, int deferred) {
+    if (deferred) offset = (uint8_t)offset;
+    uint32_t n = bytes < 0 ? 0 : (uint32_t)bytes > 0x100 ? 0x100 / 4 : (uint32_t)bytes / 4;
+    if (n < 1 || !data) return;   // under 4 bytes: dropped, as the driver does
+    if (offset < 0 || (offset & 3) || (uint32_t)offset + 4 * n > 0x100) { static int bad; if (bad++ < 8) LOG("[nvn] PushComputeConstants: table %d offset %#x bytes %#x does not fit the 256-byte root table (dropped)", table, offset, bytes); return; }
+    p_push_const *r = RECN(c, OP_PUSH_CONST, p_push_const, w, deferred ? 0 : n);
+    r->compute = 1; r->table = table & 7; r->offset = offset; r->bytes = (int32_t)(4 * n);
+    r->src = deferred ? (uint64_t)(uintptr_t)data : 0;
+    if (!deferred) memcpy(r->w, data, 4 * (size_t)n);
+}
+NVN_NOPROTO(nvnCommandBufferPushComputeConstants, void, NVNcommandBuffer *c, int table, int offset, int bytes, const void *data) { push_compute(c, table, offset, bytes, data, 0); }
+NVN_NOPROTO(nvnCommandBufferPushComputeConstantsDeferred, void, NVNcommandBuffer *c, int table, int offset, int bytes, const void *data) { push_compute(c, table, offset, bytes, data, 1); }
+
 #include "hle_nvn.adapters.inc"

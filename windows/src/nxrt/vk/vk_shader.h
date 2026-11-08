@@ -4,6 +4,7 @@
 #pragma once
 #include "vk_internal.h"
 #include "nvn_obj.h"
+#include "vk_c0.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -33,7 +34,8 @@ typedef struct vks_shader {
     uint32_t out_mask; uint8_t out_ct[8];                   // fragment outputs written
     uint32_t local[3];                                      // compute work group size
     uint8_t drv_read[3];                                    // driver segments c0 / c2 read at run time
-    int s2cs; uint32_t s2_ssbo_base, s2_tex_base, s2_ntex;  // Switch 2 packed compute bank (s2_compute_layout)
+    int s2cs; uint32_t s2_ubo_base, s2_ssbo_base, s2_tex_base, s2_ntex;  // Switch 2 packed compute bank (s2_compute_layout)
+    uint8_t s2_roots[8], s2_has_roots;                      // the root tables' word counts when the cache carries them (vksh_s2_roots); the pushed constants (vk_c0.h) go there
     uint8_t uses_subgroups;                                 // the module runs subgroup operations (reflection "uses_subgroups"): the guest assumes 32-wide warps
     uint8_t pool;                                           // the module reads the bindless pools (tex_pool / samp_pool): they are in the persistent set VKS_POOL_SET, not in this shader's own set
     uint32_t big_array, big_binding;                        // the largest descriptor array (elements) a per-draw pool cannot hold (bindless tex_pool / samp_pool), and its binding
@@ -55,6 +57,9 @@ typedef struct vks_shader {
 VkDescriptorSetLayout vksh_pool_dsl(uint32_t *ntex, uint32_t *nsamp);
 int vksh_init(void);
 void vksh_shutdown(void);
+struct vj;
+int vksh_s2_roots(const struct vj *s2_compute_layout, uint8_t out[8]);   // the eight root-table word counts of the cache, or 0 (none / NXRT_VK_S2_ROOTS=0)
+vkc0_parts vksh_s2_c0_parts(const struct vj *s2_compute_layout, unsigned nubo, unsigned nssbo);   // the Switch 2 compute bank's tables from the reflection (vk_c0.h)
 int vksh_set_of(int stage);                          // descriptor set of a stage's resources
 VkDescriptorSetLayout vksh_empty_dsl(void);
 // Stage i of program p (SetShaders' order): the shader, or NULL while it is missing from the cache (logged, dumped and requested by nxs_rt once)

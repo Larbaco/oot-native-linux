@@ -277,7 +277,18 @@ void vks_begin(void) {
 static int cur_here(void) { return g_cur >= 0 && plat_thread_id() == g_cur_tid; }
 int vks_recording(void) { return g_cur >= 0; }
 VkCommandBuffer vks_cb(void) { return g_cur >= 0 ? g_slot[g_cur].main : VK_NULL_HANDLE; }
-VkCommandBuffer vks_upload_cb(void) { if (!cur_here()) return VK_NULL_HANDLE; g_slot[g_cur].up_used = 1; return g_slot[g_cur].up; }
+// The slot's upload command buffer starts with a barrier: its copies overwrite device copies of guest pages that the shaders of the submissions before it may still be reading (or writing). Queue submission order
+// alone orders nothing between command buffers, and until a barrier covered them the first copies could run ahead of the previous submission's tail (a frame that read half-updated uniforms / ring data: a one-frame
+// white flash that only showed once the uploads got small and the GPU overlapped submissions). NXRT_VK_UPLOAD_BARRIER=0 leaves it out (for A/B)
+VkCommandBuffer vks_upload_cb(void) {
+    if (!cur_here()) return VK_NULL_HANDLE;
+    slot_t *s = &g_slot[g_cur];
+    if (!s->up_used) {
+        static int on = -1; if (on < 0) { const char *e = getenv("NXRT_VK_UPLOAD_BARRIER"); on = !(e && *e && !atoi(e)); }
+        if (on) vk_mem_barrier(s->up, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+    }
+    s->up_used = 1; return s->up;
+}
 uint64_t vks_recording_value(void) { return g_cur >= 0 ? atomic_load(&g_vk.tl_assigned) + 1 : 0; }
 
 static void post_add(post_t p) {

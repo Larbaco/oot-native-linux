@@ -32,12 +32,14 @@ typedef struct {
     uint64_t *up;                 // per page: the tracker's stamp when its device copy was taken (0 = never copied)
     uint32_t *last_dirty; uint8_t *streak, *hot;   // hot pages: written in HOT_STREAK consecutive frames, left writable and copied at every use
     uint8_t *committed;           // per page: seen committed and readable once (pool_sync asks VirtualQuery only for pages not known yet)
-    _Atomic uint8_t *gpu_pending;   // per page: GPU writes recorded whose bytes have not reached guest memory yet (the device copy is the newer one)
+    _Atomic uint32_t *gpu_pending;   // per page: GPU writes recorded whose bytes have not reached guest memory yet (the device copy is the newer one). 32 bits: a page that takes hundreds of small write-backs in flight (inline uniform updates) wrapped a byte to 0 at 256 and looked free
     uint64_t hot_n, cursor;       // vkm_sync_all's position
     uint64_t clean_epoch, pass_ep; int pass_left;   // sync_all_within: the tracker's write count at which a whole pass found nothing left to copy (0 = unknown); the count at the start of the pass in progress, and whether it stepped over pages it could not copy
     uint64_t *unc_until;          // per page: the frame until which a page found uncommitted (and zero-filled) is not asked about again
     uint64_t *hot_sub;            // hot pages: the submission whose upload command buffer last copied the page (all uploads of a submission run before its main commands, so a second copy in it changes nothing the GPU can see)
     uint8_t *owned; uint8_t **shadow;   // GPU-owned pages (written through global memory pointers): guest memory as the mirror last had it, so a CPU write is applied as the words that differ, not as the whole page
+    uint64_t *lst;                // per page (lazy): the tracker's stamp after the last write-back landing wrote the page (a later CPU write is the one that counts, see wbm_since)
+    uint8_t *rr; uint8_t **rst;   // read-and-reset pages (see rr_land): flag; per page the CPU words a landing leaves pending for the device, the learned reset words and the stamps of the last sync and landing
     uint64_t upb_use, upb_touch, upb_all, upb_first, upb_hot, uncommitted_fill;   // bytes uploaded by reason since the last statistics line (diagnostics)
     uint64_t gmem_delta;          // nonzero when the pool is in the global memory table (the first window's device address minus base)
     uint64_t win_delta[MAXWIN];   // per window: device address of its buffer minus (base + win_lo): what the global memory table holds for the pages it covers
@@ -246,6 +248,8 @@ static void pool_free(pool_t_ *p) {
     if (p->sparse) { for (uint64_t g = 0; g < p->ngran; g++) vk_free_mem(&p->gran[g]); free(p->gran); }
     else for (int k = 0; k < p->nwin; k++) vk_free_mem(&p->mem[k]);
     if (p->shadow) { for (uint64_t k = 0; k < p->npages; k++) if (p->shadow[k]) { free(p->shadow[k]); atomic_fetch_sub(&g_shadow_pages, 1); } free(p->shadow); }
+    if (p->rst) { for (uint64_t k = 0; k < p->npages; k++) free(p->rst[k]); free(p->rst); }
+    free(p->rr); free(p->lst);
     free(p->unc_until); free(p->hot_sub); free(p->owned); free(p->up); free(p->last_dirty); free(p->streak); free(p->hot); free((void *)p->gpu_pending); free(p->committed); free(p);
 }
 static void pool_free_cb(void *arg) { pool_free(arg); }
@@ -256,7 +260,7 @@ void vkm_pool_add(const void *mem, uint64_t size) {
     p->lo = (uintptr_t)mem; p->hi = p->lo + size; p->key = mem;
     p->base = p->lo & ~(uintptr_t)(PAGE - 1);
     p->size = ((p->hi - p->base) + PAGE - 1) & ~(uint64_t)(PAGE - 1); p->npages = p->size / PAGE;
-    p->up = calloc(p->npages, sizeof *p->up); p->last_dirty = calloc(p->npages, sizeof *p->last_dirty); p->streak = calloc(p->npages, 1); p->hot = calloc(p->npages, 1); p->gpu_pending = calloc(p->npages, 1);
+    p->up = calloc(p->npages, sizeof *p->up); p->last_dirty = calloc(p->npages, sizeof *p->last_dirty); p->streak = calloc(p->npages, 1); p->hot = calloc(p->npages, 1); p->gpu_pending = calloc(p->npages, sizeof *p->gpu_pending);
     p->committed = calloc(p->npages, 1);
     // Sparse backing comes in 2 MB granules: a pool smaller than that (OoT makes ~3,900 of them, most of a page to a few hundred KB) would be backed by a whole granule once touched,
     // 3,900 x 2 MB = 7.8 GB of VRAM for 5.4 GB of pools (2026-11-05: the submission failed with "Not enough memory for command submission"). Pools below NXRT_VK_SPARSE_MIN_MB
@@ -490,8 +494,148 @@ static void page_rewritten(pool_t_ *p, uint64_t pg) {   // a page copied before 
     if (p->streak[pg] >= HOT_STREAK && !p->hot[pg]) { p->hot[pg] = 1; p->hot_n++; }
 }
 // Whether page pg's device copy is behind guest memory: never copied, hot, or written (a fault stamped it) since its copy; untracked pages always are
+static uint64_t s_blk_lo, s_blk_hi;   // NXRT_VK_BLKWATCH=<hex addr>,<bytes>: log each such page in the range
+static int s_blk_on; static _Atomic uint64_t s_blk_pages, s_blk_first; static uint64_t s_blk_last[16];   // NXRT_VK_FRAMESTATS: pages a sync stepped over because of a GPU write in flight while the CPU had newer data in them (the device copy is stale until the landing)
+// ---------- Read-and-reset pages ----------
+// A "read and reset" page is a small buffer the GPU accumulates into (atomics) that the game's CPU reads back once per frame and zeroes (OoT's auto-exposure reductions). Overlapped frames land their
+// write-back ~2 frames late, and a GPU write in flight keeps the sync from uploading the page: the CPU's zero never reaches the device copy, which keeps accumulating (1x..3x, exposure blows up, one
+// white frame). A page that is classified this way is treated as GPU-owned: only the words the CPU changed since the mirror had them go over (also while a write is in flight); a landing keeps the
+// words the CPU changed and no sync has delivered yet as pending words for the device (the guest gets the GPU's bytes, the device the CPU's reset); the words learned as resets (the CPU wrote ZERO over a landed
+// nonzero word) are sent again while the CPU writes the page, even when it wrote zero over zero.
+// CLASSIFICATION (vk_rr_class.h) comes from the landings, not from blocked syncs: a small write-back (NXRT_VK_EXPO_MAXLEN bytes, default 16384) whose page the CPU then zeroes (nonzero landed -> zero) with no
+// other CPU data in it, in NXRT_VK_EXPO_FRAMES landings (default 3). A buffer the CPU fills with data (streaming, dynamic) shows CPU-written nonzero words and never converts.
+// NXRT_VK_EXPO_FIX=0 turns it all off, NXRT_VK_EXPO_PAGES=<n> (default 64) caps the converted pages, NXRT_VK_EXPO_RESEND=0 turns the unchanged re-sends off, NXRT_VK_EXPO_LOG=1 logs each conversion and the top pages
+#include "vk_rr_class.h"
+static pthread_mutex_t g_rr_mu = PTHREAD_MUTEX_INITIALIZER;
+// p->rst[pg]: [0, 4096) values of the CPU words pending for the device, [4096, +128) their mask, [+128, +256) the mask of words learned as resets, then two u64 stamps: the last sync's and the last landing's
+enum { RR_PEND = PAGE, RR_LEARN = PAGE + 128, RR_SSTAMP = PAGE + 256, RR_LSTAMP = PAGE + 264, RR_BLOCK = PAGE + 272 };
+static _Atomic uint64_t s_rr_pages, s_rr_words, s_rr_pend, s_rr_landed, s_rr_cands, s_rr_resent, s_rr_first, s_rr_capped, s_rr_stream;   // converted pages, words sent, words a landing left pending, landings over converted pages, candidate pages, unchanged learned resets sent, first conversion frame, conversions refused by the cap, candidates that showed CPU-written data
+static _Atomic int s_rr_any;
+static int rr_cfg(const char *name, int def) { const char *e = getenv(name); return e && *e ? atoi(e) : def; }
+static int rr_fix_on(void) { static int on = -1; if (on < 0) on = rr_cfg("NXRT_VK_EXPO_FIX", 1) != 0; return on; }
+// The candidates: pages that took small write-backs, with the words the last landing left in them. Open addressing on the page address; a full table takes no new candidates
+enum { RR_CAND_N = 2048 };
+static struct { uint64_t page; rrc_cand *c; } g_cand[RR_CAND_N];
+static unsigned g_ncand;
+static rrc_cand *rr_cand_get(uint64_t page, int create) {   // caller holds g_rr_mu
+    unsigned h = (unsigned)((page >> 12) * 0x9e3779b1u) & (RR_CAND_N - 1);
+    for (unsigned n = 0; n < RR_CAND_N; n++, h = (h + 1) & (RR_CAND_N - 1)) {
+        if (g_cand[h].page == page) return g_cand[h].c;
+        if (!g_cand[h].page) {
+            if (!create || g_ncand >= RR_CAND_N / 2) return NULL;
+            rrc_cand *c = calloc(1, sizeof *c); if (!c) return NULL;
+            g_cand[h].page = page; g_cand[h].c = c; g_ncand++; atomic_fetch_add(&s_rr_cands, 1); return c;
+        }
+    }
+    return NULL;
+}
+static int rr_convert(pool_t_ *p, uint64_t pg, const rrc_cand *c) {   // caller holds g_rr_mu; 1 when the page is now a read-and-reset page
+    static int cap = -1, log = -1; if (cap < 0) { cap = rr_cfg("NXRT_VK_EXPO_PAGES", 64); log = rr_cfg("NXRT_VK_EXPO_LOG", 0); }
+    if (p->rr && p->rr[pg]) return 1;
+    if ((int)atomic_load(&s_rr_pages) >= cap) { atomic_fetch_add(&s_rr_capped, 1); return 0; }
+    if (!p->owned) { p->shadow = calloc(p->npages, sizeof *p->shadow); atomic_thread_fence(memory_order_release); p->owned = calloc(p->npages, 1); }
+    if (!p->rst) p->rst = calloc(p->npages, sizeof *p->rst);
+    if (!p->rr) { uint8_t *r = calloc(p->npages, 1); atomic_thread_fence(memory_order_release); p->rr = r; }
+    if (!p->shadow || !p->owned || !p->rst || !p->rr) return 0;
+    if (!p->shadow[pg]) {   // the CPU's current words are what the mirror is taken to have: the next upload sends what differs from them
+        uint8_t *sh = malloc(PAGE); if (!sh) return 0;
+        if (guest_copy(sh, (const void *)(p->base + pg * PAGE), PAGE)) { free(sh); return 0; }
+        p->shadow[pg] = sh; atomic_fetch_add(&g_shadow_pages, 1);
+    }
+    if (!p->rst[pg]) p->rst[pg] = calloc(1, RR_BLOCK);
+    if (!p->rst[pg]) return 0;
+    memcpy(p->rst[pg] + RR_LEARN, c->reset, RRC_WORDS / 8);   // the words seen reset so far
+    if (!p->owned[pg]) { p->owned[pg] = 1; atomic_fetch_add(&s_own_pages, 1); }
+    p->rr[pg] = 1; if (!atomic_fetch_add(&s_rr_pages, 1)) atomic_store(&s_rr_first, g_frame); atomic_store(&s_rr_any, 1);
+    if (log) VKLOG("expo-fix: frame %llu page %#llx is a read-and-reset page (%u reset words, %u good landings, %u with CPU data)", (unsigned long long)g_frame, (unsigned long long)(p->base + pg * PAGE), rrc_count(c->reset), c->good, c->bad);
+    return 1;
+}
+// A landing over words of the pool (data is the landing's bytes, changed in place; kind 0 = a readback). Candidates are looked at first (the guest still holds the CPU's words); then, for read-and-reset pages: words the CPU
+// changed and no sync has handed to the device stay pending for it (value kept in rst), and the shadow takes the landed bytes
+static void rr_land(uint64_t addr, uint64_t len, uint8_t *data, int kind) {
+    static int maxlen = -1; if (maxlen < 0) maxlen = rr_cfg("NXRT_VK_EXPO_MAXLEN", 16384);
+    static int need = -1; if (need < 0) need = rr_cfg("NXRT_VK_EXPO_FRAMES", 3);
+    if (!data || !rr_fix_on()) return;
+    int cand = kind == 0 && len <= (uint64_t)maxlen;
+    if (!cand && !atomic_load(&s_rr_any)) return;
+    plat_rw_rdlock(&g_lk);
+    pool_t_ *p = pool_find((uintptr_t)addr, len);
+    if (p) for (uint64_t pg = (addr - p->base) / PAGE; pg <= (addr + len - 1 - p->base) / PAGE && pg < p->npages; pg++) {
+        uint64_t pa = p->base + pg * PAGE, a0 = addr > pa ? addr : pa, a1 = addr + len < pa + PAGE ? addr + len : pa + PAGE;
+        a0 = (a0 + 3) & ~3ull; a1 &= ~3ull;
+        if (a1 <= a0) continue;
+        pthread_mutex_lock(&g_rr_mu);
+        if (!(p->rr && p->rr[pg]) && cand) {
+            rrc_cand *c = rr_cand_get(pa, 1);
+            if (c && !c->converted) {
+                uint32_t guest[RRC_WORDS]; unsigned n = (unsigned)((a1 - a0) / 4);
+                for (unsigned i = 0; i < n; i++) guest[i] = *(volatile uint32_t *)(uintptr_t)(a0 + 4 * i);
+                uint32_t bad0 = c->bad;
+                if (rrc_observe(c, (unsigned)((a0 - pa) / 4), n, guest, (const uint32_t *)(data + (a0 - addr)), (unsigned)need) && !rr_convert(p, pg, c)) c->converted = 0;   // not converted (cap): looked at again
+                if (c->bad == 3 && bad0 == 2 && !c->good) atomic_fetch_add(&s_rr_stream, 1);
+            }
+        }
+        if (p->rr && p->rr[pg]) {
+            uint32_t *sh = (uint32_t *)p->shadow[pg];
+            static int resend = -1; if (resend < 0) resend = rr_cfg("NXRT_VK_EXPO_RESEND", 1);
+            uint8_t *lm = p->rst[pg] + RR_LEARN; int wrote = 0;
+            if (resend) { uint64_t ss = *(uint64_t *)(p->rst[pg] + RR_SSTAMP), ls = *(uint64_t *)(p->rst[pg] + RR_LSTAMP), since = ss > ls ? ss : ls; wrote = p->hot[pg] || !since || nvn_dirty_since_span(p->span, (const void *)pa, PAGE, since); }   // the CPU wrote the page since the last sync and landing (possibly the same bytes again)
+            for (uint64_t a = a0; a < a1; a += 4) {
+                uint32_t *d = (uint32_t *)(data + (a - addr)); unsigned i = (unsigned)((a - pa) / 4);
+                uint32_t gv = *(volatile uint32_t *)(uintptr_t)a;
+                if (gv != sh[i] || (wrote && gv == 0 && (lm[i >> 3] & (1u << (i & 7))))) {   // the CPU wrote this word since the mirror had it, or a learned reset word (zero) in a page it wrote: the device gets it at the next sync
+                    uint32_t *rv = (uint32_t *)p->rst[pg]; uint8_t *mk = p->rst[pg] + RR_PEND;
+                    if (!(mk[i >> 3] & (1u << (i & 7)))) { mk[i >> 3] |= (uint8_t)(1u << (i & 7)); rv[i] = gv; atomic_fetch_add(&s_rr_pend, 1); }
+                }
+                sh[i] = *d;
+            }
+            atomic_fetch_add(&s_rr_landed, 1);
+        }
+        pthread_mutex_unlock(&g_rr_mu);
+    }
+    plat_rw_rdunlock(&g_lk);
+}
+// A landing over read-and-reset pages must apply in full (their resets are handled by rr_land / the sync; keeping the CPU's zero would hide the GPU's counts from it): the merged bytes there go back to the landing's
+static void rr_restore(uint64_t addr, uint64_t len, uint8_t *merged, const uint8_t *raw) {
+    if (!atomic_load(&s_rr_any)) return;
+    plat_rw_rdlock(&g_lk);
+    pool_t_ *p = pool_find((uintptr_t)addr, len);
+    if (p && p->rr) for (uint64_t pg = (addr - p->base) / PAGE; pg <= (addr + len - 1 - p->base) / PAGE && pg < p->npages; pg++) {
+        if (!p->rr[pg]) continue;
+        uint64_t pa = p->base + pg * PAGE, lo = addr > pa ? addr : pa, hi = addr + len < pa + PAGE ? addr + len : pa + PAGE;
+        memcpy(merged + (lo - addr), raw + (lo - addr), (size_t)(hi - lo));
+    }
+    plat_rw_rdunlock(&g_lk);
+}
+static void rr_landed(uint64_t addr, uint64_t len) {   // the landing has written the guest: later CPU writes are the ones newer than this stamp
+    if (!atomic_load(&s_rr_any)) return;
+    plat_rw_rdlock(&g_lk);
+    pool_t_ *p = pool_find((uintptr_t)addr, len);
+    if (p && p->rr) for (uint64_t pg = (addr - p->base) / PAGE; pg <= (addr + len - 1 - p->base) / PAGE && pg < p->npages; pg++) {
+        if (!p->rr[pg]) continue;
+        pthread_mutex_lock(&g_rr_mu);
+        if (p->rst[pg]) *(uint64_t *)(p->rst[pg] + RR_LSTAMP) = nvn_dirty_now();
+        pthread_mutex_unlock(&g_rr_mu);
+    }
+    plat_rw_rdunlock(&g_lk);
+}
+// NXRT_VK_EXPO_LOG=1: the converted pages with their reset-word counts (at most 16), at the every-300-frames summary
+static void rr_top_log(void) {
+    pthread_mutex_lock(&g_rr_mu); int shown = 0;
+    for (unsigned h = 0; h < RR_CAND_N && shown < 16; h++) if (g_cand[h].page && g_cand[h].c->converted) { rrc_cand *c = g_cand[h].c; shown++;
+        VKLOG("expo-fix:   page %#llx: %u reset words, %u good landings, %u with CPU data", (unsigned long long)g_cand[h].page, rrc_count(c->reset), c->good, c->bad); }
+    pthread_mutex_unlock(&g_rr_mu);
+}
 static inline int page_needs(pool_t_ *p, uint64_t pg) {
-    if (atomic_load(&p->gpu_pending[pg])) return 0;   // a GPU write in flight: the device copy is ahead until its bytes are written back
+    if (atomic_load(&p->gpu_pending[pg])) {   // a GPU write in flight: the device copy is ahead until its bytes are written back
+        static int rr = -1; if (rr < 0) rr = rr_cfg("NXRT_VK_EXPO_FIX", 1);
+        if (rr && p->rr && p->rr[pg]) goto normal;   // a read-and-reset page: only the CPU's changed words go over, so the write in flight is no reason to wait
+        if (s_blk_on) { int cpu_newer = !p->up[pg] || (p->span && nvn_dirty_since_span(p->span, (const void *)(p->base + pg * PAGE), PAGE, p->up[pg]));   // diagnostics: the CPU has data in the page that the device copy lacks
+                        if (cpu_newer && s_blk_lo) { uint64_t a = p->base + pg * PAGE; if (a >= s_blk_lo && a < s_blk_hi) VKLOG("blk: frame %llu page %#llx not uploaded: a GPU write is in flight (pending %u), up %llu, CPU newer", (unsigned long long)g_frame, (unsigned long long)a, (unsigned)atomic_load(&p->gpu_pending[pg]), (unsigned long long)p->up[pg]); }
+                        if (cpu_newer) { uint64_t n = atomic_fetch_add(&s_blk_pages, 1); s_blk_last[n % 16] = p->base + pg * PAGE; if (!p->up[pg]) atomic_fetch_add(&s_blk_first, 1); } }
+        return 0;
+    }
+normal:
     if (p->hot[pg] && p->up[pg] && p->hot_sub && p->hot_sub[pg] && p->hot_sub[pg] == vks_recording_value()) return 0;   // already copied for this submission
     if (!p->up[pg] || p->hot[pg] || !p->span) return 1;
     return nvn_dirty_since_span(p->span, (const void *)(p->base + pg * PAGE), PAGE, p->up[pg]);
@@ -523,7 +667,15 @@ static void pool_fill_zero(pool_t_ *p, VkCommandBuffer cb, uint64_t off, uint64_
 // Order per run (nxnative's): take the stamp, write-protect, then read guest memory: a write after the protection faults and is seen at the next check
 static __thread int s_only_dirty;   // set around pool_sync by vkm_gmem_commit_sync: only pages copied before whose device copy is now behind (CPU rewrites), never the first copies
 #define PAGE_NEEDS(p, pg) (page_needs((p), (pg)) && (!s_only_dirty || (p)->up[(pg)]))
+// NXRT_VK_WB_LOCK=1 (experiment): a write-back's landing (guest write, pending count, adoption) and a pool sync (the copy of guest pages into upload runs) exclude each other
+static pthread_mutex_t g_wbl_mu = PTHREAD_MUTEX_INITIALIZER;
+static int wb_lock_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("NXRT_VK_WB_LOCK"); on = e && atoi(e); } return on; }
+static uint64_t pool_sync_(pool_t_ *p, uint64_t p0, uint64_t p1, VkCommandBuffer cb, uint64_t budget, uint64_t *stop_at);
 static uint64_t pool_sync(pool_t_ *p, uint64_t p0, uint64_t p1, VkCommandBuffer cb, uint64_t budget, uint64_t *stop_at) {
+    if (!wb_lock_on()) return pool_sync_(p, p0, p1, cb, budget, stop_at);
+    pthread_mutex_lock(&g_wbl_mu); uint64_t r = pool_sync_(p, p0, p1, cb, budget, stop_at); pthread_mutex_unlock(&g_wbl_mu); return r;
+}
+static uint64_t pool_sync_(pool_t_ *p, uint64_t p0, uint64_t p1, VkCommandBuffer cb, uint64_t budget, uint64_t *stop_at) {
     if (!p->span) p->span = nvn_dirty_span((const void *)p->lo, p->hi - p->lo);
     if (p1 > p->npages) p1 = p->npages;
     copy_batch b; b.n = 0; b.src = b.dst = VK_NULL_HANDLE;
@@ -573,12 +725,45 @@ static uint64_t pool_sync(pool_t_ *p, uint64_t p0, uint64_t p1, VkCommandBuffer 
         VkBuffer sb; VkDeviceSize so;
         uint64_t tg = now_ns(); uint8_t *dst = vkm_staging(n, 16, &sb, &so); atomic_fetch_add(&s_t_bind, now_ns() - tg);
         if (!dst) { pg = run0; t_left = 1; break; }
+        if (s_blk_lo && p->base + off < s_blk_hi && p->base + off + n > s_blk_lo) VKLOG("blk: frame %llu upload %#llx+%llu in submission %llu", (unsigned long long)g_frame, (unsigned long long)(p->base + off), (unsigned long long)n, (unsigned long long)vks_recording_value());
         { uint64_t tc = now_ns(); guest_copy(dst, (const void *)(p->base + off), (size_t)n); atomic_fetch_add(&s_t_copy, now_ns() - tc); }
         { uint64_t first = 0, hot = 0; for (uint64_t k = run0; k < pg; k++) { first += !p->up[k]; hot += p->hot[k]; }
           p->upb_first += first * PAGE; p->upb_hot += hot * PAGE; if (t_why == 1) p->upb_touch += n; else if (t_why == 2) p->upb_all += n; else p->upb_use += n; }
         for (uint64_t k = run0; k < pg; k++) p->up[k] = stamp;
         { uint64_t sub = vks_recording_value(); if (sub) { int any = 0; for (uint64_t k = run0; k < pg && !any; k++) any = p->hot[k]; if (any) { if (!p->hot_sub) p->hot_sub = calloc(p->npages, sizeof *p->hot_sub); if (p->hot_sub) for (uint64_t k = run0; k < pg; k++) p->hot_sub[k] = sub; } } }
         for (uint64_t a = run0; a < pg; ) {
+            if (p->rr && p->rr[a] && p->shadow && p->shadow[a]) {   // a read-and-reset page: the words the CPU changed (and the ones a landing handed over, see rr_land) go over, nothing else
+                uint8_t *pd = dst + (a - run0) * PAGE; uint32_t *g = (uint32_t *)pd; uint32_t cur[PAGE / 4]; static __thread uint8_t send[PAGE / 4];
+                pthread_mutex_lock(&g_rr_mu);
+                guest_copy(pd, (const void *)(p->base + a * PAGE), PAGE);   // the guest as it is now, under the lock a landing takes (the copy of the run may be older than a landing)
+                memcpy(cur, pd, PAGE);
+                uint32_t *sh = (uint32_t *)p->shadow[a];
+                {   // words the CPU changed are learned as reset words; while the CPU writes the page (since the last sync and the last landing) every learned reset word is sent again with its value, even
+                    // when it did not change: a read-and-reset that finds the same bytes again (the landing is late, it read its own zero) is still a reset in the game's order, and the device
+                    // must not keep accumulating from the one before
+                    static int resend = -1; if (resend < 0) resend = rr_cfg("NXRT_VK_EXPO_RESEND", 1);
+                    uint8_t *blk = p->rst[a]; uint8_t *lm = blk + RR_LEARN; uint64_t *ss = (uint64_t *)(blk + RR_SSTAMP), *ls = (uint64_t *)(blk + RR_LSTAMP);
+                    uint64_t since = *ss > *ls ? *ss : *ls;
+                    int wrote = resend && (p->hot[a] || !since || nvn_dirty_since_span(p->span, (const void *)(p->base + a * PAGE), PAGE, since));
+                    for (unsigned i = 0; i < PAGE / 4; i++) {
+                        int ch = cur[i] != sh[i];
+                        if (ch && cur[i] == 0) lm[i >> 3] |= (uint8_t)(1u << (i & 7));   // zero over a nonzero word: a reset
+                        send[i] = (uint8_t)ch;
+                        if (!ch && wrote && cur[i] == 0 && (lm[i >> 3] & (1u << (i & 7)))) { send[i] = 1; atomic_fetch_add(&s_rr_resent, 1); }
+                    }
+                    *ss = stamp;
+                }
+                if (p->rst && p->rst[a]) { const uint32_t *rv = (const uint32_t *)p->rst[a]; uint8_t *mk = p->rst[a] + PAGE; for (unsigned i = 0; i < PAGE / 4; i++) if (mk[i >> 3] & (1u << (i & 7))) { g[i] = rv[i]; send[i] = 1; } memset(mk, 0, 128); }
+                for (unsigned i = 0; i < PAGE / 4; ) {
+                    if (!send[i]) { i++; continue; }
+                    unsigned j = i; while (j < PAGE / 4 && send[j]) j++;
+                    batch_put(&b, p, cb, sb, so + (a - run0) * PAGE + i * 4, a * PAGE + i * 4, (j - i) * 4);
+                    atomic_fetch_add(&s_rr_words, j - i); i = j;
+                }
+                memcpy(sh, cur, PAGE);
+                pthread_mutex_unlock(&g_rr_mu);
+                a++; continue;
+            }
             if (p->owned && p->owned[a]) {   // a GPU-owned page: only the words the CPU changed since the mirror had it go over; the rest is the GPU's
                 const uint32_t *g = (const uint32_t *)(dst + (a - run0) * PAGE);
                 if (!p->shadow[a]) { p->shadow[a] = malloc(PAGE); atomic_fetch_add(&g_shadow_pages, 1); memcpy(p->shadow[a], g, PAGE); batch_put(&b, p, cb, sb, so + (a - run0) * PAGE, a * PAGE, PAGE); atomic_fetch_add(&s_own_full, 1); }
@@ -752,12 +937,34 @@ static uint64_t sync_all_within(uint64_t g_scan_pages) {
 static void gpu_pending(uint64_t a, uint64_t len, int d) {
     plat_rw_rdlock(&g_lk);
     pool_t_ *p = pool_find((uintptr_t)a, len);
-    if (p) for (uint64_t pg = (a - p->base) / PAGE; pg <= (a + len - 1 - p->base) / PAGE && pg < p->npages; pg++) atomic_fetch_add(&p->gpu_pending[pg], (uint8_t)d);
+    if (p) for (uint64_t pg = (a - p->base) / PAGE; pg <= (a + len - 1 - p->base) / PAGE && pg < p->npages; pg++) atomic_fetch_add(&p->gpu_pending[pg], (uint32_t)d);
     plat_rw_rdunlock(&g_lk);
 }
 
 // ---------- GPU writes back to guest memory ----------
-typedef struct { uint64_t addr, len; VkBuffer buf; vk_alloc mem; const uint8_t *cpu; uint32_t fill; int kind; } wb_t;   // kind 0 readback, 1 known bytes, 2 fill
+typedef struct wb_s { uint64_t addr, len; VkBuffer buf; vk_alloc mem; const uint8_t *cpu; uint32_t fill; int kind; uint64_t stamp, seq; char key[17];
+                      uint8_t *g0; struct wb_s *next, *prev; } wb_t;   // kind 0 readback, 1 known bytes, 2 fill; g0 = the guest's bytes at record time (small ranges), the list = records not landed yet, in order
+#include "vk_wb_merge.h"
+void vkp_order_stats(uint64_t *n, uint64_t *back, uint64_t *same_val, uint64_t *same_tex);
+// NXRT_VK_WB_MERGE (default 1; 0 = off, the old landing that puts its bytes over everything): a landing keeps the words the CPU wrote after the write-back was recorded (see vk_wb_merge.h). The guest's bytes at record
+// time are kept for ranges up to NXRT_VK_WB_KEEP_MAX bytes (default 65536); bigger ones only count the pages they overwrote that the CPU had written since (the tracker's generation)
+static pthread_mutex_t g_wbp_mu = PTHREAD_MUTEX_INITIALIZER; static wb_t *g_wbp_tail;
+static _Atomic uint64_t s_wm_lands, s_wm_kept_lands, s_wm_kept_words, s_wm_big_kept, s_wm_big_edge, s_wm_total;   // landings, landings that kept CPU words, words kept, pages of bigger ranges overwritten though the CPU wrote them since the record
+static int wb_merge_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("NXRT_VK_WB_MERGE"); on = !(e && *e && !atoi(e)); } return on; }
+static uint64_t wb_keep_max(void) { static uint64_t v = ~0ull; if (v == ~0ull) { const char *e = getenv("NXRT_VK_WB_KEEP_MAX"); v = e ? strtoull(e, NULL, 0) : 65536; } return v; }
+static void wb_keep(wb_t *w) {   // at record time: remember the guest's bytes, queue the record
+    if (wb_merge_on() && w->len <= wb_keep_max() && w->len) { w->g0 = malloc((size_t)w->len); if (w->g0 && guest_copy(w->g0, (const void *)(uintptr_t)w->addr, (size_t)w->len)) { free(w->g0); w->g0 = NULL; } }
+    pthread_mutex_lock(&g_wbp_mu);
+    w->prev = g_wbp_tail; w->next = NULL; if (g_wbp_tail) g_wbp_tail->next = w; g_wbp_tail = w;
+    pthread_mutex_unlock(&g_wbp_mu);
+}
+static void wb_unkeep(wb_t *w, const uint8_t *landed) {   // at landing: leave the queue; the records recorded after this one see the bytes it put in the guest
+    pthread_mutex_lock(&g_wbp_mu);
+    if (w->prev) w->prev->next = w->next;
+    if (w->next) w->next->prev = w->prev; else g_wbp_tail = w->prev;
+    if (landed) for (wb_t *r = w->next; r; r = r->next) if (r->g0) wbm_patch(r->g0, r->addr, r->len, w->addr, w->len, landed);
+    pthread_mutex_unlock(&g_wbp_mu);
+}
 // NXRT_VK_NANFIX=<hex address>[,<hex address>...] (an experiment): a write-back that starts at one of those addresses has its NaN words replaced by the last finite value that word had (0 before
 // one): "what the CPU would read if the shader never summed a NaN". Only for ranges up to 4160 bytes
 static int nanfix_hit(uint64_t addr, uint64_t len, int *slot) {
@@ -782,30 +989,86 @@ static _Atomic uint64_t s_wb_adopted, s_wb_adopt_miss, s_wb_same;   // pages ado
 static int wb_adopt_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("NXRT_VK_WB_ADOPT"); on = !(e && *e && !atoi(e)); } return on; }
 // NXRT_VK_WB_DIFF (default 1, with WB_ADOPT): the bytes of a write-back that guest memory already holds are not written: most of what a compute pass writes back each frame is what it wrote back the frame before, and writing it
 // meant un-protecting its pages (a system call and a new generation each) and copying them. Only the page-sized chunks that differ are written; the rest of the range is read, not written
-static void wb_apply(uint64_t addr, uint64_t len, const uint8_t *src) {
+// NXRT_VK_WB_RACE=1 (diagnostics): at landing, pages the write-back is about to change that the CPU wrote after the write-back was recorded (their generation is newer than the stamp taken at record time): the
+// landing would put the device's older bytes over the CPU's newer ones. Counted and the first ones logged with both values (writes by other landings count too: the values tell them apart)
+static _Atomic uint64_t s_wr_pages, s_wr_chunks;
+static int wb_race_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("NXRT_VK_WB_RACE"); on = e && atoi(e); } return on; }
+static void wb_race(uint64_t addr, uint64_t len, const uint8_t *src, uint64_t stamp, int kind) {
+    if (!wb_race_on() || !stamp) return;
+    for (uint64_t o = 0; o < len; ) {
+        uint64_t pe = ((addr + o) | (PAGE - 1)) + 1 - addr; if (pe > len) pe = len;
+        const uint8_t *g = (const uint8_t *)(uintptr_t)(addr + o);
+        if (memcmp(g, src + o, (size_t)(pe - o)) && nvn_dirty_since((const void *)g, 1, stamp)) {
+            uint64_t n = atomic_fetch_add(&s_wr_pages, 1);
+            if (n < 60 || !(n % 1000)) { uint64_t d0 = 0; while (d0 < pe - o && g[d0] == src[o + d0]) d0++; uint64_t gv = 0, sv = 0; memcpy(&gv, g + (d0 & ~7ull), 8); memcpy(&sv, src + o + (d0 & ~7ull), 8);
+                VKLOG("wb race #%llu: kind %d range %#llx+%llu lands over page %#llx that the CPU wrote since it was recorded; first difference at +%llu: guest %016llx, device %016llx", (unsigned long long)n, kind, (unsigned long long)addr, (unsigned long long)len, (unsigned long long)(addr + o) & ~(uint64_t)(PAGE - 1), (unsigned long long)d0, (unsigned long long)gv, (unsigned long long)sv); }
+        }
+        o = pe;
+    }
+}
+// NXRT_VK_WB_PAGEKEEP (default 1; 0 = a landing writes every page that differs, as before): pages of a BIG write-back (no g0) that the CPU wrote since the record are not overwritten (wbm_page_action). Hot pages count as written (the
+// tracker does not see them); GPU-owned and read-and-reset pages are written as ever. NXRT_VK_WB_COUNT=1 also counts, without changing anything, the pages the no-adoption path overwrites though the CPU wrote them (it
+// otherwise compares nothing)
+static int wb_pagekeep_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("NXRT_VK_WB_PAGEKEEP"); on = !(e && *e && !atoi(e)); } return on; }
+static int wb_count_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("NXRT_VK_WB_COUNT"); on = e && atoi(e); } return on; }
+static pthread_mutex_t g_lst_mu = PTHREAD_MUTEX_INITIALIZER;
+static int wb_cpu_newer(pool_t_ *p, uint64_t pa, uint64_t stamp) {   // caller holds g_lk for reading when p != NULL
+    uint64_t since = stamp;
+    if (p && pa >= p->base && pa < p->base + p->size) {
+        uint64_t pg = (pa - p->base) / PAGE;
+        if ((p->owned && p->owned[pg]) || (p->rr && p->rr[pg])) return 0;
+        if (p->hot[pg]) return 1;
+        if (p->lst) since = wbm_since(stamp, p->lst[pg]);
+    }
+    return nvn_dirty_since((const void *)(uintptr_t)pa, 1, since);
+}
+static void wb_note_landing(pool_t_ *p, uint64_t addr, uint64_t len) {   // the pages [addr, addr+len) were just written by a landing
+    if (!p || addr < p->base || addr + len > p->base + p->size) return;
+    if (!p->lst) { pthread_mutex_lock(&g_lst_mu); if (!p->lst) { uint64_t *l = calloc(p->npages, sizeof *l); atomic_thread_fence(memory_order_release); p->lst = l; } pthread_mutex_unlock(&g_lst_mu); if (!p->lst) return; }
+    uint64_t ls = nvn_dirty_now();
+    for (uint64_t pg = (addr - p->base) / PAGE; pg <= (addr + len - 1 - p->base) / PAGE && pg < p->npages; pg++) p->lst[pg] = ls;
+}
+static void wb_apply(uint64_t addr, uint64_t len, const uint8_t *src, uint64_t stamp, int big) {
     static int on = -1; if (on < 0) { const char *e = getenv("NXRT_VK_WB_DIFF"); on = !(e && *e && !atoi(e)); }
     uint8_t *d = (uint8_t *)(uintptr_t)addr;
-    if (!on || !wb_adopt_on()) { dm_guest_write_prepare(d, (size_t)len); memcpy(d, src, (size_t)len); return; }
-    uint64_t o = 0, same = 0;
+    int pk = big && stamp && wb_pagekeep_on();
+    if (!on || !wb_adopt_on()) {
+        if (big && stamp && wb_count_on()) {   // count only: the differing pages a CPU write is overwritten on
+            plat_rw_rdlock(&g_lk); pool_t_ *p = pool_find((uintptr_t)addr, len);
+            for (uint64_t o = 0; o < len; ) { uint64_t pe = ((addr + o) | (PAGE - 1)) + 1 - addr; if (pe > len) pe = len; if (memcmp(d + o, src + o, (size_t)(pe - o)) && wb_cpu_newer(p, (addr + o) & ~(uint64_t)(PAGE - 1), stamp)) atomic_fetch_add(&s_wm_big_edge, 1); o = pe; }
+            plat_rw_rdunlock(&g_lk);
+        }
+        dm_guest_write_prepare(d, (size_t)len); memcpy(d, src, (size_t)len); return;
+    }
+    plat_rw_rdlock(&g_lk);
+    pool_t_ *p = pk ? pool_find((uintptr_t)addr, len) : NULL;
+    uint64_t o = 0, same = 0, run0 = ~0ull;
+#define WB_FLUSH() do { if (run0 != ~0ull) { dm_guest_write_prepare(d + run0, (size_t)(o - run0)); memcpy(d + run0, src + run0, (size_t)(o - run0)); if (pk) wb_note_landing(p, addr + run0, o - run0); run0 = ~0ull; } } while (0)
     while (o < len) {
         uint64_t pe = ((addr + o) | (PAGE - 1)) + 1 - addr; if (pe > len) pe = len;
-        if (!memcmp(d + o, src + o, (size_t)(pe - o))) { same += pe - o; o = pe; continue; }
-        uint64_t r0 = o; o = pe;
-        while (o < len) { pe = ((addr + o) | (PAGE - 1)) + 1 - addr; if (pe > len) pe = len; if (!memcmp(d + o, src + o, (size_t)(pe - o))) break; o = pe; }
-        dm_guest_write_prepare(d + r0, (size_t)(o - r0)); memcpy(d + r0, src + r0, (size_t)(o - r0));
+        if (!memcmp(d + o, src + o, (size_t)(pe - o))) { WB_FLUSH(); same += pe - o; o = pe; continue; }
+        uint64_t pa = (addr + o) & ~(uint64_t)(PAGE - 1); int full = pa >= addr && pa + PAGE <= addr + len;
+        int act = pk ? wbm_page_action(1, full, wb_cpu_newer(p, pa, stamp)) : WBP_WRITE;
+        if (act == WBP_KEEP) { WB_FLUSH(); atomic_fetch_add(&s_wm_big_kept, 1); o = pe; continue; }   // the guest's page is newer than the device's: it stays, and stays unadopted (it differs), so the next sync uploads it
+        if (act == WBP_EDGE_DIRTY) atomic_fetch_add(&s_wm_big_edge, 1);
+        if (run0 == ~0ull) run0 = o;
+        o = pe;
     }
+    WB_FLUSH();
+#undef WB_FLUSH
+    plat_rw_rdunlock(&g_lk);
     atomic_fetch_add(&s_wb_same, same);
 }
 // NXRT_VK_WB_VERIFY=1 (diagnostics): a ring of the pages adopted; every 15 frames wb_verify reads some of them back from the device and compares them with guest memory (a page the CPU has not written
 // since, no GPU write in flight): a difference is a device copy that was taken for current and is not
 static struct { uint64_t addr[2048]; unsigned n; pthread_mutex_t lk; } g_av = {.lk = PTHREAD_MUTEX_INITIALIZER};
 static _Atomic uint64_t s_av_checked, s_av_bad;
-static int wb_verify_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("NXRT_VK_WB_VERIFY"); on = e && atoi(e); } return on; }
+static int wb_verify_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("NXRT_VK_WB_VERIFY"); on = e ? atoi(e) : 0; } return on; }
 static void wb_verify(void) {
     if (!wb_verify_on()) return;
-    uint64_t pick[16]; int np = 0;
+    uint64_t pick[256]; int np = 0, want = wb_verify_on() > 1 ? (wb_verify_on() < 256 ? wb_verify_on() : 256) : 16;   // NXRT_VK_WB_VERIFY=<n> > 1: n pages a check (up to 256), every 3 frames
     pthread_mutex_lock(&g_av.lk);
-    for (int i = 0; i < 16 && g_av.n; i++) { unsigned k = (unsigned)rand() % (g_av.n < 2048 ? g_av.n : 2048); pick[np++] = g_av.addr[k]; }
+    for (int i = 0; i < want && g_av.n; i++) { unsigned k = (unsigned)rand() % (g_av.n < 2048 ? g_av.n : 2048); pick[np++] = g_av.addr[k]; }
     g_av.n = 0;
     pthread_mutex_unlock(&g_av.lk);
     for (int i = 0; i < np; i++) {
@@ -825,8 +1088,30 @@ static void wb_verify(void) {
         }
     }
 }
-static void wb_adopt(uint64_t addr, uint64_t len, const uint8_t *data) {
-    if (!wb_adopt_on() || !data) return;
+// NXRT_VK_ADOPT_SKIP=<key prefix>[,...] / NXRT_VK_ADOPT_ONLY=<key prefix>[,...] (diagnostics): the write-backs of those shaders are (not) adopted. The per-shader adoption totals are logged with the adoption line when either is set or NXRT_VK_FRAMESTATS=1
+static struct { char key[17]; uint64_t pages, lands; } g_ak[96]; static int g_nak; static pthread_mutex_t g_ak_mu = PTHREAD_MUTEX_INITIALIZER;
+static int adopt_key_ok(const char *key) {
+    static const char *skip, *only; static int init;
+    if (!init) { init = 1; skip = getenv("NXRT_VK_ADOPT_SKIP"); only = getenv("NXRT_VK_ADOPT_ONLY"); }
+    if (!skip && !only) return 1;
+    #define LISTED(l) ({ int hit = 0; if (l) { const char *q = (l); while (*q) { size_t n = strcspn(q, ","); if (n && !strncmp(key, q, n)) hit = 1; q += n + (q[n] ? 1 : 0); } } hit; })
+    if (only) return LISTED(only);
+    return !LISTED(skip);
+}
+static void adopt_key_note(const char *key, uint64_t pages) {
+    pthread_mutex_lock(&g_ak_mu); int i; for (i = 0; i < g_nak && strcmp(g_ak[i].key, key); i++) ;
+    if (i == g_nak && g_nak < 96) { snprintf(g_ak[g_nak].key, 17, "%s", key); g_nak++; }
+    if (i < g_nak) { g_ak[i].pages += pages; g_ak[i].lands++; }
+    pthread_mutex_unlock(&g_ak_mu);
+}
+// NXRT_VK_ADOPT_STRICT (default 1; 0 = the old adoption): the pages a landing wrote (the dirty ones) are NOT marked current: they stay behind guest memory and the next sync copies them to the device, as the no-adoption
+// path does for every page of a write-back (which is the path that shows no stale frames). The diff writes stay (pages whose bytes already matched are neither written nor copied): only the few pages a landing changed are
+// uploaded again (~80 a frame in the forest), not the whole range. The adoption marked a page current from the landing's bytes alone, a claim the device's copy never had to back; NXRT_VK_WB_VERIFY=256 with STRICT=0 checks it
+static _Atomic uint64_t s_wb_adopt_strict;   // pages left for re-upload by the strict mode
+static int adopt_strict(void) { static int on = -1; if (on < 0) { const char *e = getenv("NXRT_VK_ADOPT_STRICT"); on = !(e && *e && !atoi(e)); } return on; }
+static void wb_adopt(uint64_t addr, uint64_t len, const uint8_t *data, const char *key) {
+    if (!wb_adopt_on() || !data || !adopt_key_ok(key)) return;
+    uint64_t adopted0 = atomic_load(&s_wb_adopted);
     plat_rw_rdlock(&g_lk);
     pool_t_ *p = pool_find((uintptr_t)addr, len);
     if (p && p->span && addr >= p->base) {
@@ -839,11 +1124,13 @@ static void wb_adopt(uint64_t addr, uint64_t len, const uint8_t *data) {
             for (uint64_t k = run0; k < pg; ) {   // the pages written (or otherwise behind) since their copy; a page whose bytes matched and is still protected is current as it is
                 if (!nvn_dirty_since_span(p->span, (const void *)(p->base + k * PAGE), PAGE, p->up[k])) { k++; continue; }
                 uint64_t k0 = k; while (k < pg && nvn_dirty_since_span(p->span, (const void *)(p->base + k * PAGE), PAGE, p->up[k])) k++;
+                if (adopt_strict()) { atomic_fetch_add(&s_wb_adopt_strict, k - k0); continue; }   // left dirty: the next sync copies them from guest memory
                 uint64_t stamp = nvn_dirty_now();
-                nvn_dirty_protect((const void *)(p->base + k0 * PAGE), (size_t)((k - k0) * PAGE));
+                static int mode = -1; if (mode < 0) { const char *e = getenv("NXRT_VK_ADOPT_MODE"); mode = e ? atoi(e) : 0; }   // experiments: 1 = protect and compare but never mark current, 2 = mark current without protecting
+                if (mode != 2) nvn_dirty_protect((const void *)(p->base + k0 * PAGE), (size_t)((k - k0) * PAGE));
                 for (uint64_t q = k0; q < k; q++) {
                     const void *gp = (const void *)(p->base + q * PAGE), *dp = data + (p->base + q * PAGE - addr);
-                    if (!memcmp(gp, dp, PAGE) && !atomic_load(&p->gpu_pending[q])) { p->up[q] = stamp; atomic_fetch_add(&s_wb_adopted, 1);
+                    if (!memcmp(gp, dp, PAGE) && !atomic_load(&p->gpu_pending[q])) { if (mode != 1) p->up[q] = stamp; atomic_fetch_add(&s_wb_adopted, 1);
                         if (wb_verify_on()) { pthread_mutex_lock(&g_av.lk); if (g_av.n < 2048) g_av.addr[g_av.n++] = (uint64_t)(uintptr_t)gp; pthread_mutex_unlock(&g_av.lk); } }
                     else atomic_fetch_add(&s_wb_adopt_miss, 1);
                 }
@@ -851,16 +1138,68 @@ static void wb_adopt(uint64_t addr, uint64_t len, const uint8_t *data) {
         }
     }
     plat_rw_rdunlock(&g_lk);
+    adopt_key_note(key, atomic_load(&s_wb_adopted) - adopted0);
 }
+static void wb_land_(wb_t *w);
 static void wb_land(void *arg) {
     wb_t *w = arg;
+    if (wb_lock_on()) { pthread_mutex_lock(&g_wbl_mu); wb_land_(w); pthread_mutex_unlock(&g_wbl_mu); } else wb_land_(w);
+}
+// NXRT_VK_NANLOG=1 (diagnostics): the float words with an all-ones exponent (NaN / Inf, or other bits that look like it) in each compute write-back, summed per shader key and logged once a frame ("nan: ...")
+static struct { char key[17]; uint64_t words, lands, first_off; uint64_t addr, len; } g_nl[64]; static int g_nnl; static pthread_mutex_t g_nl_mu = PTHREAD_MUTEX_INITIALIZER;
+static int nanlog_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("NXRT_VK_NANLOG"); on = e && atoi(e); } return on; }
+static void nanlog_scan(const wb_t *w) {
+    const uint32_t *u = (const uint32_t *)w->mem.map; uint64_t n = w->len / 4, c = 0, first = 0;
+    for (uint64_t i = 0; i < n; i++) if ((u[i] & 0x7f800000u) == 0x7f800000u) { if (!c++) first = i * 4; }
+    if (!c) return;
+    pthread_mutex_lock(&g_nl_mu); int i; for (i = 0; i < g_nnl && (strcmp(g_nl[i].key, w->key) || g_nl[i].addr != w->addr); i++) ;
+    if (i == g_nnl && g_nnl < 64) { snprintf(g_nl[g_nnl].key, 17, "%s", w->key); g_nl[g_nnl].addr = w->addr; g_nl[g_nnl].len = w->len; g_nnl++; }
+    if (i < g_nnl) { g_nl[i].words += c; g_nl[i].lands++; g_nl[i].first_off = first; }
+    pthread_mutex_unlock(&g_nl_mu);
+}
+static void nanlog_tick(uint64_t frame) {
+    if (!g_nnl) return;
+    pthread_mutex_lock(&g_nl_mu);
+    for (int i = 0; i < g_nnl; i++) if (g_nl[i].lands) { VKLOG("nan: frame %llu shader %s addr %#llx len %llu: %llu words in %llu landings (first at +%llu)", (unsigned long long)frame, g_nl[i].key, (unsigned long long)g_nl[i].addr, (unsigned long long)g_nl[i].len, (unsigned long long)g_nl[i].words, (unsigned long long)g_nl[i].lands, (unsigned long long)g_nl[i].first_off); g_nl[i].words = g_nl[i].lands = 0; }
+    pthread_mutex_unlock(&g_nl_mu);
+}
+static void wb_land_(wb_t *w) {
+    if (w->kind == 0 && nanlog_on()) nanlog_scan(w);
+    {   // NXRT_VK_EXLOG=1 (diagnostics): the landings of the exposure reductions (2cfd3d8d, 5a6f9e2a): the first four words as they land and as the CPU had them
+        static int on = -1; if (on < 0) { const char *e = getenv("NXRT_VK_EXLOG"); on = e && atoi(e); }
+        if (on && w->kind == 0 && w->len >= 16 && (!strncmp(w->key, "2cfd3d8d", 8) || !strncmp(w->key, "5a6f9e2a", 8))) {
+            const uint32_t *d = (const uint32_t *)w->mem.map, *g = (const uint32_t *)(uintptr_t)w->addr;
+            VKLOG("blk: frame %llu land %.8s addr %#llx len %llu data %08x %08x %08x %08x guest-before %08x %08x %08x %08x", (unsigned long long)g_frame, w->key, (unsigned long long)w->addr, (unsigned long long)w->len, d[0], d[1], d[2], d[3], g[0], g[1], g[2], g[3]);
+        }
+    }
     if (w->kind == 0) nanfix(w);
     uint8_t *d = (uint8_t *)(uintptr_t)w->addr;
-    if (w->kind == 0) wb_apply(w->addr, w->len, w->mem.map);
-    else if (w->kind == 1) wb_apply(w->addr, w->len, w->cpu);
+    const uint8_t *raw = w->kind == 0 ? w->mem.map : w->kind == 1 ? w->cpu : NULL;   // the bytes landing (a fill: w->fill, below)
+    uint8_t *fillbuf = NULL, *merged = NULL; const uint8_t *eff = raw;
+    if (w->kind == 2 && w->g0) { fillbuf = malloc((size_t)w->len); if (fillbuf) { for (uint64_t i = 0; i < w->len; i++) fillbuf[i] = (uint8_t)(w->fill >> 8 * (i & 3)); raw = eff = fillbuf; } }
+    atomic_fetch_add(&s_wm_lands, 1);
+    if (w->g0 && raw) {   // the words the CPU wrote since the record stay
+        uint8_t *cur = malloc((size_t)w->len); merged = malloc((size_t)w->len);
+        if (cur && merged && !guest_copy(cur, d, (size_t)w->len)) {
+            wbm_merge(merged, w->addr, w->len, cur, w->g0, raw);
+            rr_restore(w->addr, w->len, merged, raw);
+            uint64_t kept = 0; for (uint64_t i = 0; i < w->len; i += 4) { uint64_t n = w->len - i < 4 ? w->len - i : 4; kept += memcmp(merged + i, raw + i, (size_t)n) != 0; }   // words that stay as the CPU has them and differ from the landing
+            if (kept) { atomic_fetch_add(&s_wm_kept_lands, 1); atomic_fetch_add(&s_wm_kept_words, kept); eff = merged; }
+        }
+        free(cur);
+    }
+    if (w->kind <= 1) rr_land(w->addr, w->len, (uint8_t *)eff, w->kind);
+    if (w->kind <= 1) wb_race(w->addr, w->len, w->kind ? w->cpu : w->mem.map, w->stamp, w->kind);
+    if (eff == merged && merged) wb_apply(w->addr, w->len, eff, w->stamp, 0);
+    else if (w->kind == 0) wb_apply(w->addr, w->len, w->mem.map, w->stamp, !w->g0);
+    else if (w->kind == 1) wb_apply(w->addr, w->len, w->cpu, w->stamp, !w->g0);
+    else if (fillbuf) wb_apply(w->addr, w->len, fillbuf, w->stamp, 0);
     else { dm_guest_write_prepare((void *)(uintptr_t)w->addr, (size_t)w->len); for (uint64_t i = 0; i < w->len; i++) d[i] = (uint8_t)(w->fill >> 8 * (i & 3)); }
+    wb_unkeep(w, raw ? eff : NULL);
+    free(merged); free(fillbuf); free(w->g0);
     gpu_pending(w->addr, w->len, -1);
-    if (w->kind == 0) wb_adopt(w->addr, w->len, w->mem.map); else if (w->kind == 1) wb_adopt(w->addr, w->len, w->cpu);
+    if (w->kind <= 1) rr_landed(w->addr, w->len);
+    if (w->kind == 0) wb_adopt(w->addr, w->len, w->mem.map, w->key); else if (w->kind == 1) wb_adopt(w->addr, w->len, w->cpu, w->key);
     atomic_fetch_add(&s_wb_bytes, w->len);
     if (w->buf) { vkDestroyBuffer(g_vk.dev, w->buf, NULL); vk_free_mem(&w->mem); }
     free((void *)w->cpu); free(w);
@@ -884,12 +1223,13 @@ static void wbl_report(uint64_t frame) {
     }
     for (int i = 0; i < g_nwbl; i++) g_wbl[i].why = NULL;
 }
-void vkm_gpu_wrote(uint64_t addr, uint64_t len) {
+void vkm_gpu_wrote(uint64_t addr, uint64_t len) { vkm_gpu_wrote_k(addr, len, "?"); }
+void vkm_gpu_wrote_k(uint64_t addr, uint64_t len, const char *key) {
     VkBuffer pb; VkDeviceSize po;
     wbl_note(addr, len);
     VkCommandBuffer cb = vks_cb();
     if (!cb || !len || !vkm_addr(addr, len, &pb, &po)) return;
-    wb_t *w = calloc(1, sizeof *w); w->addr = addr; w->len = len;
+    wb_t *w = calloc(1, sizeof *w); w->addr = addr; w->len = len; w->stamp = nvn_dirty_now(); snprintf(w->key, sizeof w->key, "%s", key);
     VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, len, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
     vkCreateBuffer(g_vk.dev, &bci, NULL, &w->buf);
     VkMemoryRequirements mr; vkGetBufferMemoryRequirements(g_vk.dev, w->buf, &mr);
@@ -901,13 +1241,16 @@ void vkm_gpu_wrote(uint64_t addr, uint64_t len) {
     vkCmdCopyBuffer(cb, pb, w->buf, 1, &c);
     vk_mem_barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
     gpu_pending(addr, len, 1);
+    if (s_blk_lo && addr < s_blk_hi && addr + len > s_blk_lo) VKLOG("blk: frame %llu record write-back %#llx+%llu (%s) in submission %llu", (unsigned long long)g_frame, (unsigned long long)addr, (unsigned long long)len, key, (unsigned long long)vks_recording_value());
+    wb_keep(w);
     vks_post_fn(wb_land, w);
 }
 // Writes whose bytes the CPU knows (inline uniform updates, fills): the GPU writes the mirror in order, guest memory gets the same bytes at completion
 void vkm_cpu_also(uint64_t addr, uint64_t len, const void *data, int fill, uint32_t value) {
-    wb_t *w = calloc(1, sizeof *w); w->addr = addr; w->len = len; w->kind = fill ? 2 : 1; w->fill = value;
+    wb_t *w = calloc(1, sizeof *w); w->addr = addr; w->len = len; w->kind = fill ? 2 : 1; w->fill = value; w->stamp = nvn_dirty_now();
     if (!fill) { uint8_t *c = malloc((size_t)len); memcpy(c, data, (size_t)len); w->cpu = c; }
     gpu_pending(addr, len, 1);
+    wb_keep(w);
     vks_post_fn(wb_land, w);
 }
 
@@ -1114,15 +1457,34 @@ static void upload_report(uint64_t df, int always) {
 
 void vkm_frame_tick(uint64_t frame) {
     static vkm_stats_t prev; static uint64_t prev_frame, t_prev;
-    wbl_report(frame);
+    { static int bi; if (!bi) { bi = 1; const char *e = getenv("NXRT_VK_BLKWATCH"); if (e) { char *end; s_blk_lo = strtoull(e, &end, 16); s_blk_hi = s_blk_lo + (*end == ',' ? strtoull(end + 1, NULL, 0) : 4096); s_blk_on = 1; } } }
+    wbl_report(frame); nanlog_tick(frame);
+    { static int on = -1; if (on < 0) { const char *e = getenv("NXRT_VK_FRAMESTATS"); on = e && atoi(e); }   // one line a frame: what the write-back landings did since the last one (flash hunting)
+      if (on) { static uint64_t pa, pm, ps, pw, pu, pbl; uint64_t a = atomic_load(&s_wb_adopted), m = atomic_load(&s_wb_adopt_miss), sm = atomic_load(&s_wb_same), wb = atomic_load(&s_wb_bytes), up = atomic_load(&s_up_bytes), bl = atomic_load(&s_blk_pages);
+          s_blk_on = 1;
+          VKLOG("fm: frame %llu blocked %llu (never copied %llu in all) last %#llx adopted %llu miss %llu same %llu KB wb %llu KB uploaded %llu KB", (unsigned long long)frame, (unsigned long long)(bl - pbl), (unsigned long long)atomic_load(&s_blk_first), (unsigned long long)s_blk_last[(bl + 15) % 16],
+                (unsigned long long)(a - pa), (unsigned long long)(m - pm), (unsigned long long)((sm - ps) >> 10), (unsigned long long)((wb - pw) >> 10), (unsigned long long)((up - pu) >> 10));
+          pa = a; pm = m; ps = sm; pw = wb; pu = up; pbl = bl; } }
     g_frame = frame + 1; g_budget_used = 0;
-    if (frame % 15 == 0) wb_verify();
+    if (frame % (wb_verify_on() > 1 ? 3 : 15) == 0) wb_verify();
     if (frame % HOT_COOL_FRAMES == 0) {   // hot pages cool down: protected again at their next copy; written again, they come back within HOT_STREAK frames
         plat_rw_rdlock(&g_lk);
         for (int i = 0; i < g_npool; i++) { pool_t_ *p = g_pool[i]; for (uint64_t k = 0; k < p->npages; k++) if (p->hot[k]) { p->hot[k] = 0; p->up[k] = 0; p->streak[k] = 0; } p->hot_n = 0; p->clean_epoch = 0; }   // copied (and protected) again at the next sync
         plat_rw_rdunlock(&g_lk);
     }
     { static uint64_t last_rep; if (frame % 100 == 0 && frame != last_rep) { upload_report(frame - last_rep > 1000 ? 100 : frame - last_rep, 0); last_rep = frame; } }
+    {   // always, next to the "frame pacing" line (the same every-300-frames cadence): whether the read-and-reset detection fired, and when
+        static uint64_t last_rr; if (frame % 300 == 0 && frame != last_rr) { last_rr = frame; static uint64_t pw, pr, pl; uint64_t w = atomic_load(&s_rr_words), r = atomic_load(&s_rr_resent), l = atomic_load(&s_rr_landed);
+          VKLOG("expo-fix up to frame %llu: %s; %llu read-and-reset pages (first at frame %llu, %llu refused by the cap) of %llu candidate pages (%llu showed CPU-written data); words sent from the CPU %llu (+%llu), of them %llu unchanged learned resets (+%llu); %llu landings over them (+%llu), %llu words left pending by a landing; WB_ADOPT %s",
+                (unsigned long long)frame, rr_fix_on() ? "on" : "OFF", (unsigned long long)atomic_load(&s_rr_pages), (unsigned long long)atomic_load(&s_rr_first), (unsigned long long)atomic_load(&s_rr_capped), (unsigned long long)atomic_load(&s_rr_cands), (unsigned long long)atomic_load(&s_rr_stream),
+                (unsigned long long)w, (unsigned long long)(w - pw), (unsigned long long)r, (unsigned long long)(r - pr), (unsigned long long)l, (unsigned long long)(l - pl), (unsigned long long)atomic_load(&s_rr_pend), wb_adopt_on() ? "on" : "OFF");
+          pw = w; pr = r; pl = l; if (rr_cfg("NXRT_VK_EXPO_LOG", 0)) rr_top_log();
+          uint64_t pn, pb, psv, pst; vkp_order_stats(&pn, &pb, &psv, &pst); static uint64_t lpn, lpb, lpsv, lpst, llands, lkl, lkw, lbig, ledge; uint64_t ll = atomic_load(&s_wm_lands), kl = atomic_load(&s_wm_kept_lands), kw = atomic_load(&s_wm_kept_words), big = atomic_load(&s_wm_big_kept), edge = atomic_load(&s_wm_big_edge);
+          VKLOG("rewind-check up to frame %llu: WB_MERGE %s; write-back landings %llu (+%llu), of them %llu (+%llu) held words the CPU wrote after the record that were kept (%llu words, +%llu), %llu (+%llu) pages of big write-backs KEPT because the CPU wrote them since the record, %llu (+%llu) edge/uncovered pages overwritten though the CPU had written them; presents drawn %llu (+%llu): timeline value went BACK %llu (+%llu), did not advance %llu (+%llu), same texture twice %llu (+%llu)",
+                (unsigned long long)frame, wb_merge_on() ? "on" : "OFF", (unsigned long long)ll, (unsigned long long)(ll - llands), (unsigned long long)kl, (unsigned long long)(kl - lkl), (unsigned long long)kw, (unsigned long long)(kw - lkw), (unsigned long long)big, (unsigned long long)(big - lbig), (unsigned long long)edge, (unsigned long long)(edge - ledge),
+                (unsigned long long)pn, (unsigned long long)(pn - lpn), (unsigned long long)pb, (unsigned long long)(pb - lpb), (unsigned long long)psv, (unsigned long long)(psv - lpsv), (unsigned long long)pst, (unsigned long long)(pst - lpst));
+          lpn = pn; lpb = pb; lpsv = psv; lpst = pst; llands = ll; lkl = kl; lkw = kw; lbig = big; ledge = edge; }
+    }
     if (frame % 300 || frame == prev_frame) return;
     vkm_stats_t s; vkm_stats(&s);
     uint64_t df = frame - prev_frame, now = now_ns(); double secs = t_prev ? (now - t_prev) / 1e9 : 0;
@@ -1136,7 +1498,9 @@ void vkm_frame_tick(uint64_t frame) {
           (unsigned long long)s.staging_waits, usage / 1048576.0, budget / 1048576.0, secs > 0 ? "" : "");
     VKLOG("pool_sync time in all: %.0f ms asking the OS about pages, %.0f ms copying guest memory, %.0f ms protecting pages, %.0f ms binding sparse memory / waiting for staging (of which %.0f ms waiting for the GPU to free the ring, %.0f ms making overflow buffers); %llu MB of uncommitted pages skipped (known zero)", atomic_load(&s_t_query) / 1e6, atomic_load(&s_t_copy) / 1e6, atomic_load(&s_t_prot) / 1e6, atomic_load(&s_t_bind) / 1e6, atomic_load(&s_t_stwait) / 1e6, atomic_load(&s_t_stovf) / 1e6, (unsigned long long)(atomic_load(&s_unc_skipped) * PAGE >> 20));
     if (atomic_load(&s_sync_skipped)) VKLOG("pool scans up to frame %llu: %llu skipped as unwritten since a complete pass (%llu found behind guest memory by the check)", (unsigned long long)frame, (unsigned long long)atomic_load(&s_sync_skipped), (unsigned long long)atomic_load(&s_sync_skip_bad));
-    if (atomic_load(&s_wb_adopted) + atomic_load(&s_wb_adopt_miss)) VKLOG("write-back adoption up to frame %llu: %llu pages kept current without a copy back (%.0f MB), %llu not (CPU wrote them first); %.0f MB of the write-backs already matched guest memory and were not written; verify: %llu pages checked, %llu differ", (unsigned long long)frame, (unsigned long long)atomic_load(&s_wb_adopted), atomic_load(&s_wb_adopted) * PAGE / 1048576.0, (unsigned long long)atomic_load(&s_wb_adopt_miss), atomic_load(&s_wb_same) / 1048576.0, (unsigned long long)atomic_load(&s_av_checked), (unsigned long long)atomic_load(&s_av_bad));
+    if (g_nak && frame % 900 == 0) { pthread_mutex_lock(&g_ak_mu); for (int i = 0; i < g_nak; i++) VKLOG("adoption by shader %s: %llu pages in %llu landings", g_ak[i].key, (unsigned long long)g_ak[i].pages, (unsigned long long)g_ak[i].lands); pthread_mutex_unlock(&g_ak_mu); }
+    if (atomic_load(&s_wr_pages)) VKLOG("wb race up to frame %llu: %llu pages overwritten by a landing though the CPU wrote them after the write-back was recorded", (unsigned long long)frame, (unsigned long long)atomic_load(&s_wr_pages));
+    if (atomic_load(&s_wb_adopted) + atomic_load(&s_wb_adopt_miss) + atomic_load(&s_wb_adopt_strict)) VKLOG("write-back adoption (STRICT %s: %llu pages left for re-upload) up to frame %llu: %llu pages kept current without a copy back (%.0f MB), %llu not (CPU wrote them first); %.0f MB of the write-backs already matched guest memory and were not written; verify: %llu pages checked, %llu differ", adopt_strict() ? "on" : "OFF", (unsigned long long)atomic_load(&s_wb_adopt_strict), (unsigned long long)frame, (unsigned long long)atomic_load(&s_wb_adopted), atomic_load(&s_wb_adopted) * PAGE / 1048576.0, (unsigned long long)atomic_load(&s_wb_adopt_miss), atomic_load(&s_wb_same) / 1048576.0, (unsigned long long)atomic_load(&s_av_checked), (unsigned long long)atomic_load(&s_av_bad));
     if (atomic_load(&s_own_pages)) VKLOG("GPU-owned pages up to frame %llu: %llu pages (%llu shadows), %llu words applied in place from the CPU, %llu whole pages first copied", (unsigned long long)frame, (unsigned long long)atomic_load(&s_own_pages), (unsigned long long)atomic_load(&g_shadow_pages), (unsigned long long)atomic_load(&s_own_words), (unsigned long long)atomic_load(&s_own_full));
     if (atomic_load(&s_gmem_programs)) VKLOG("global memory up to frame %llu: %llu programs bound, %llu pointers followed, %llu pool syncs for them (%.0f MB of CPU-rewritten pages sent unbudgeted), page table %llu of %llu words", (unsigned long long)frame,
           (unsigned long long)atomic_load(&s_gmem_programs), (unsigned long long)atomic_load(&s_gmem_touches), (unsigned long long)atomic_load(&s_gmem_syncs), atomic_load(&s_gmem_dirty_bytes) / 1048576.0, (unsigned long long)g_gt.next, (unsigned long long)g_gt.words);

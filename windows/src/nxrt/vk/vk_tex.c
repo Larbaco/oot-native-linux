@@ -408,8 +408,7 @@ VkImageView vkt_view(vkt_image *im, const view_t *v, int set_swz, uint16_t swz) 
         case NVN_TEXTURE_TARGET_3D: vt = VK_IMAGE_VIEW_TYPE_3D; break;
         }
     }
-    VkImageAspectFlags asp = im->aspect;
-    if (asp == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) asp = v && v->set_dsmode && v->dsmode == 1 ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
+    VkImageAspectFlags asp = vkt_sample_aspect(im->aspect, v && v->set_dsmode, v ? v->dsmode : 0);
     if ((vt == VK_IMAGE_VIEW_TYPE_CUBE || vt == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) && !(im->vtype == VK_IMAGE_VIEW_TYPE_CUBE || im->vtype == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY)) {
         static int n; if (n++ < 8) VKRED("a cube view of a %ux%u texture that is not a cube map: viewed as a 2D array", im->w, im->h);
         vt = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
@@ -447,7 +446,52 @@ static VkSamplerAddressMode wrap(uint8_t w) {
     default: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;   // CLAMP (GL's half-border clamp) and CLAMP_TO_EDGE
     }
 }
-VkSampler vkt_sampler(const samp_par *p) {
+// The compare function as Vulkan numbers it: NVN's (NEVER = 1 .. ALWAYS = 8, the GL order) shifted by one; an unset one is NEVER. Dref OP texel in both APIs
+VkCompareOp vkt_cmp_op(uint8_t f) { return (VkCompareOp)(f >= 1 && f <= 8 ? f - 1 : 0); }
+// The sampler's cache key: the whole parameter block (no padding: 8 bytes and 8 floats), with what the sampler ignores zeroed: the compare function while the compare mode is off
+samp_par vkt_samp_key(const samp_par *p) {
+    _Static_assert(sizeof(samp_par) == 40, "samp_par is the sampler cache's key: bytes, no padding");
+    samp_par k = *p; if (k.cmp_mode != NVN_COMPARE_MODE_COMPARE_R_TO_TEXTURE) k.cmp_func = 0;
+    return k;
+}
+// P3 / N1: the sampler a texture of the given aspects needs. A sampler that asks for depth comparison on an image with no depth aspect is undefined in Vulkan (VUID-vkCmdDraw-None-06479; a
+// 1x1 black / white colour texture under a shadow sampler: the game's default for lights without shadows): the same sampler with the comparison off. 1 when it changed *out, else *out = *p
+int vkt_samp_for_aspect(const samp_par *p, VkImageAspectFlags aspect, samp_par *out) {
+    *out = *p;
+    if (p->cmp_mode != NVN_COMPARE_MODE_COMPARE_R_TO_TEXTURE || (aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) return 0;
+    out->cmp_mode = NVN_COMPARE_MODE_NONE; out->cmp_func = 0;
+    return 1;
+}
+int vkt_compare_fix_parse(const char *e) { return !(e && *e == '0'); }   // NXRT_VK_COMPARE_FIX: on unless "0..." (the owner's A/B switch)
+int vkt_compare_fix_enabled(void) { static int on = -1; if (on < 0) on = vkt_compare_fix_parse(getenv("NXRT_VK_COMPARE_FIX")); return on; }
+// A depth-comparing sample of a texture (the shader declares a 2D depth-compare image, "t2ds") reads a depth view; a texture with no depth aspect is stood in for by the replay's 1x1 depth twin
+int vkt_cmp_needs_twin(int shader_depth_compare, VkImageAspectFlags image_aspect) { return shader_depth_compare && !(image_aspect & VK_IMAGE_ASPECT_DEPTH_BIT); }
+// The aspect a sampled view of an image shows: depth, or stencil when the view asks for stencil reads of a depth-stencil image (NVN TextureView DepthStencilMode)
+VkImageAspectFlags vkt_sample_aspect(VkImageAspectFlags a, int set_dsmode, int dsmode) {
+    return a == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) ? (set_dsmode && dsmode == 1 ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT) : a;
+}
+static vk_hmap g_cmpfix_seen = {sizeof(samp_par) + 4};   // (sampler, NVN format) → logged
+static _Atomic uint64_t s_cmpfix;
+// Whether (sampler, format) is new: the first sight of each pair logs once
+int vkt_cmpfix_first(const samp_par *p, int nvn_format) {
+    uint8_t k[sizeof(samp_par) + 4]; samp_par q = vkt_samp_key(p); memcpy(k, &q, sizeof q); memcpy(k + sizeof q, &nvn_format, 4);
+    plat_rw_wrlock(&g_lk); int fresh = !vk_hm_get(&g_cmpfix_seen, k); if (fresh) vk_hm_put(&g_cmpfix_seen, k, (void *)1); plat_rw_wrunlock(&g_lk);
+    return fresh;
+}
+uint64_t vkt_cmpfix_count(void) { return atomic_load(&s_cmpfix); }
+VkSampler vkt_sampler_for(const samp_par *p, const vkt_image *im) {
+    samp_par q;
+    if (im && vkt_compare_fix_enabled() && vkt_samp_for_aspect(p, im->aspect, &q)) {
+        atomic_fetch_add(&s_cmpfix, 1);
+        if (vkt_cmpfix_first(p, (int)im->d.format))
+            VKLOG("compare-fix: a sampler with depth comparison (func %u) meets a colour image (%s, ser%llu %ux%u, NVN format %#x): bound with the comparison off (NXRT_VK_COMPARE_FIX=0 turns this off)",
+                  (unsigned)p->cmp_func, im->fi ? im->fi->name : "?", (unsigned long long)im->serial, im->w, im->h, (unsigned)im->d.format);
+        return vkt_sampler(&q);
+    }
+    return vkt_sampler(p);
+}
+VkSampler vkt_sampler(const samp_par *pp) {
+    samp_par key = vkt_samp_key(pp); const samp_par *p = &key;   // the cache and the sampler made from it see the key's form
     plat_rw_wrlock(&g_lk);
     VkSampler s = (VkSampler)vk_hm_get(&g_samp, p);
     if (s) { plat_rw_wrunlock(&g_lk); return s; }
@@ -457,7 +501,7 @@ VkSampler vkt_sampler(const samp_par *p) {
         (p->minf == NVN_MIN_FILTER_LINEAR || p->minf == NVN_MIN_FILTER_LINEAR_MIPMAP_NEAREST || p->minf == NVN_MIN_FILTER_LINEAR_MIPMAP_LINEAR) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
         (p->minf == NVN_MIN_FILTER_NEAREST_MIPMAP_LINEAR || p->minf == NVN_MIN_FILTER_LINEAR_MIPMAP_LINEAR) ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST,
         wrap(p->ws), wrap(p->wt), wrap(p->wr), p->lod_bias, p->aniso > 1.0f && g_vk.f10.samplerAnisotropy, p->aniso > 1.0f ? fminf(p->aniso, g_vk.props.limits.maxSamplerAnisotropy) : 1.0f,
-        p->cmp_mode == NVN_COMPARE_MODE_COMPARE_R_TO_TEXTURE, (VkCompareOp)(p->cmp_func >= 1 && p->cmp_func <= 8 ? p->cmp_func - 1 : 0),
+        p->cmp_mode == NVN_COMPARE_MODE_COMPARE_R_TO_TEXTURE, vkt_cmp_op(p->cmp_func),
         mipf ? p->lod_min : 0.0f, mipf ? p->lod_max : 0.25f, VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK, VK_FALSE};
     VkSamplerCustomBorderColorCreateInfoEXT cb = {VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT, NULL, {{p->border[0], p->border[1], p->border[2], p->border[3]}}, VK_FORMAT_UNDEFINED};
     VkSamplerReductionModeCreateInfo rm = {VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO, NULL,

@@ -199,6 +199,28 @@ int main(void) {
     gfx_null_stats(&n0); CALL(nvnQueueSubmitCommands, P(q), 1, P(&hb)); gfx_null_stats(&n1);
     T(n1.draws - n0.draws == 2 && n1.calls - n0.calls == 2 && n1.bad == n0.bad);
 
+    /* nvnCommandBufferPushComputeConstants (P3b): recorded in order with the dispatches (OP_PUSH_CONST); under 4 bytes and past the 256-byte table are dropped; the Deferred form keeps the pointer, not the words */
+    { uint32_t pw[4] = {0x39b60b61, 0x3a21d13a, 0x45340000, 0x44ca8000};
+      CALL(nvnCommandBufferBeginRecording, P(cb));
+      CALL(nvnCommandBufferPushComputeConstants, P(cb), 0, 0, 16, P(pw));
+      CALL(nvnCommandBufferDispatchCompute, P(cb), 1, 1, 1);
+      CALL(nvnCommandBufferPushComputeConstants, P(cb), 0, 0, 2, P(pw));
+      CALL(nvnCommandBufferPushComputeConstants, P(cb), 0, 0xf8, 16, P(pw));
+      CALL(nvnCommandBufferPushComputeConstantsDeferred, P(cb), 3, 8, 16, P(pw));
+      CALL(nvnCommandBufferDispatchCompute, P(cb), 2, 1, 1);
+      uint64_t hp = CALL(nvnCommandBufferEndRecording, P(cb));
+      uint32_t pops[8]; int pn = ops_of((const uint8_t *)(uintptr_t)hp, pops, 8);
+      static const uint32_t want_p[] = {OP_PUSH_CONST, OP_DISPATCH, OP_PUSH_CONST, OP_DISPATCH, OP_END};
+      T(pn == 5 && !memcmp(pops, want_p, sizeof want_p));
+      const uint8_t *r0 = (const uint8_t *)(uintptr_t)hp; op_hdr h0; memcpy(&h0, r0, 8);
+      p_push_const pc0; memset(&pc0, 0, sizeof pc0); memcpy(&pc0, r0 + 8, h0.size - 8);
+      T(h0.size == 8 + offsetof(p_push_const, w) + 16 && pc0.compute == 1 && pc0.table == 0 && pc0.offset == 0 && pc0.bytes == 16 && pc0.src == 0 && !memcmp(pc0.w, pw, 16));
+      const uint8_t *r2 = r0 + h0.size; op_hdr h1; memcpy(&h1, r2, 8); r2 += h1.size; op_hdr h2; memcpy(&h2, r2, 8);
+      p_push_const pc2; memset(&pc2, 0, sizeof pc2); memcpy(&pc2, r2 + 8, h2.size - 8);
+      T(h2.op == OP_PUSH_CONST && h2.size == 8 + offsetof(p_push_const, w) && pc2.table == 3 && pc2.offset == 8 && pc2.bytes == 16 && pc2.src == P(pw));
+      gfx_null_stats(&n0); CALL(nvnQueueSubmitCommands, P(q), 1, P(&hp)); gfx_null_stats(&n1);
+      T(n1.op[OP_PUSH_CONST] - n0.op[OP_PUSH_CONST] == 2 && n1.dispatches - n0.dispatches == 2 && n1.bad == n0.bad); }
+
     /* command memory runs out: the game's callback (a guest function) adds 256-byte chunks; the recording continues across a JUMP */
     g_cb_pool = pool; g_cb_next = 0x400000;
     CALL(nvnCommandBufferSetMemoryCallback, P(cb), gt_fn(mem_callback)); CALL(nvnCommandBufferSetMemoryCallbackData, P(cb), 0x77);

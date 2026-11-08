@@ -508,7 +508,7 @@ class ImageOffset(Pass):
     translator writes a texel offset it could not fold, or that comes from a register, as Offset. A constant one becomes ConstOffset (same operand, other bit). A
     non-constant one on an OpImageFetch is exactly an addition on the integer coordinates (texelFetch(t, p + o, lod)), so the fetch reads at p + o and loses the operand.
     Offsets on the sampling operations (float coordinates, an unknown level for the implicit forms) stay as they are: there the module is still invalid"""
-    name, version = 'image_offset', 1
+    name, version = 'image_offset', 2   # invalidate shader chains for the ISA shadow audit
     OpIAdd, OpImageFetch = 128, 95
     SAMPLES = range(87, 96)   # OpImageSample{Implicit,Explicit}Lod, Dref*, Proj*, OpImageFetch
     DREF = (89, 90, 93, 94)

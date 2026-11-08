@@ -11,9 +11,11 @@
 #include "vk_thandle.h"
 #include "vk_fmt.h"
 #include "vk_shader.h"
+#include "vk_c0.h"
 #include "vk_pipe.h"
 #include "vk_hmap.h"
 #include "vk_shot.h"
+#include "movie_chain.h"
 static void pk_note(uint64_t a, uint32_t n);
 #include "nvn_timestamp.h"
 #include "clear_vert.h"
@@ -29,6 +31,9 @@ static void pk_note(uint64_t a, uint32_t n);
 #include <stdlib.h>
 #include <string.h>
 
+typedef struct { char *list; int init; } keylist;
+static int key_listed(keylist *kl, const char *env, const char *def, const char *key);
+
 void dm_guest_write_prepare(void *addr, size_t len);
 int nvn_dpool_base(const void *pool, int tex);   // hle_nvn.c: where a descriptor pool's IDs start in the host table
 void vk_note_fence_sync(sync_t *s);              // gfx_vk.c: the sync gets the submission's value at the commit
@@ -38,6 +43,8 @@ void vkpc_note_created(int n);
 #define RED_ONCE(id, ...) do { static int once_##id; if (!once_##id++) VKRED(__VA_ARGS__); } while (0)
 enum { UBANK_SIZE = 65536, SUPPORT_SIZE = 1392, ZERO_SIZE = 65536, NTEX = 256, MAXB = 192, NQ = 4096 };
 
+static uint64_t g_fh, g_fh_clears, g_fh_cond;   // NXRT_VK_FRAMESTATS=1 (diagnostics, flash hunting): a hash of the frame's passes, clears (with colours), dispatches and conditional renders, logged once a frame
+#define FH(x) (g_fh = (g_fh ^ (uint64_t)(x)) * 1099511628211ull)
 uint64_t vks_scan_cur_frame(void); static vkr_stats_t g_st; static uint64_t g_scan_frame;   // g_scan_frame: the frame number (NXRT_VK_NANSCAN tags)
 static uint64_t g_img_nostorage;   // images img_view found without storage use (a dispatch that binds one is skipped)
 static uint64_t g_pd_frame, g_pd_last; static int g_pd;   // NXRT_VK_PASSDUMP=<present>[-<present>]: the frames after those presents, pass by pass and draw by draw, in the log
@@ -183,6 +190,7 @@ typedef struct rs {
     float blend_color[4], alpha_ref; int64_t copy_stride, copy_img_stride;
     int tf_on, rast_discard, tex_base, samp_base, render_skip, vis_on;
     p_prim_restart restart;
+    vkc0_push cpc; uint64_t cpc_n;   // the compute root tables' pushed words (nvnCommandBufferPushComputeConstants, vk_c0.h) and how many pushes applied
     // render targets (the snapshots copied: the record's command memory may be reused after the submission)
     int nrt; tex_t ct[8]; uint8_t has_ct[8]; view_t cview[8]; uint8_t has_cview[8]; tex_t dt; uint8_t has_dt; view_t dview; uint8_t has_dview;
     p_scissor sc; int has_sc;
@@ -226,7 +234,7 @@ static void barrier_all(VkCommandBuffer cb) {
 }
 
 // ---------- GPU writes into pools: copied back to guest memory at completion (vkm_gpu_wrote; transfers cannot be recorded inside a pass) ----------
-static struct { uint64_t a, n; } g_wb[256]; static int g_nwb;
+static struct { uint64_t a, n; char key[17]; } g_wb[256]; static int g_nwb;
 // NXRT_VK_WRITEBACK: 0 no compute write-back at all (the CPU reads the values the game wrote itself: for A/B), 1 storage buffers a compute shader writes (the default), 2 also the memory that
 // shaders with untracked global stores (gmem_bda) write through: the first NXRT_VK_WB_GMEM bytes (default 64 KiB) of each pointer's mapping. NXRT_VK_WB_MAX caps one storage buffer's write-back (0 = none)
 static const vks_shader *g_cur_sh;
@@ -237,9 +245,9 @@ static void wb_add(uint64_t a, uint64_t n) {
     if (vkm_rdwatch_gpu()) vkm_rdwatch_add(a, n, g_cur_sh ? g_cur_sh->key : "?");
     if (wb_max() && n > wb_max()) n = wb_max() & ~3ull;
     for (int k = 0; k < g_nwb; k++) if (g_wb[k].a == a && g_wb[k].n == n) return;
-    if (g_nwb < 256) { g_wb[g_nwb].a = a; g_wb[g_nwb].n = n; g_nwb++; }
+    if (g_nwb < 256) { g_wb[g_nwb].a = a; g_wb[g_nwb].n = n; snprintf(g_wb[g_nwb].key, sizeof g_wb[g_nwb].key, "%s", g_cur_sh ? g_cur_sh->key : "?"); g_nwb++; }
 }
-static void wb_flush(void) { for (int i = 0; i < g_nwb; i++) { vkm_gpu_wrote(g_wb[i].a, g_wb[i].n); g_st.writebacks++; } g_nwb = 0; }
+static void wb_flush(void) { for (int i = 0; i < g_nwb; i++) { vkm_gpu_wrote_k(g_wb[i].a, g_wb[i].n, g_wb[i].key); g_st.writebacks++; } g_nwb = 0; }
 
 // ---------- Occlusion queries: samples counted from a reset to each report, summed on the CPU when the GPU is done (in submission order) ----------
 static _Atomic uint8_t g_qbusy[NQ]; static uint32_t g_qnext; static uint64_t g_vis_acc;
@@ -358,7 +366,7 @@ static int pass_begin(void) {
     sa = da;
     VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, {{0, 0}, {w, h}}, 1, 0, (uint32_t)P.ncolor, ca, P.hd ? &da : NULL, P.hs ? &sa : NULL};
     vkCmdBeginRendering(cb, &ri);
-    P.open = 1; g_st.passes++;
+    P.open = 1; g_st.passes++; FH(0xBE); FH(w); FH(h); FH(P.ncolor); for (int i = 0; i < P.ncolor; i++) if (P.cv[i]) FH(P.ci[i]->serial); if (P.dv) FH(P.di->serial);
     if (g_pd) {
         char b[600]; int o = 0;
         for (int i = 0; i < P.ncolor; i++) if (P.cv[i]) o += snprintf(b + o, sizeof b - o, " c%d=ser%llu/%s/%ux%u", i, (unsigned long long)P.ci[i]->serial, P.ci[i]->fi->name, P.cw[i], P.ch[i]);
@@ -494,6 +502,7 @@ static void clear_draw(vkt_image *im, VkFormat f, uint32_t level, uint32_t l0, u
 }
 static void clear_color(const p_clear_color *c) {
     if (S->render_skip) return;
+    { uint32_t f[4]; memcpy(f, c->rgba, 16); FH(0xC1); FH(c->index); FH(c->mask); FH(f[0]); FH(f[1]); FH(f[2]); FH(f[3]); g_fh_clears++; }
     if (!P.valid) pass_targets();
     int i = c->index;
     if (i < 0 || i >= 8 || !P.cv[i]) { if (i < 0 || i >= S->nrt || !S->has_ct[i]) RED_ONCE(20, "colour clear of target %d, which is not set", i); return; }
@@ -519,6 +528,7 @@ static void note_depth_copy(uint64_t serial) { g_cpd[g_cpd_i].serial = serial; g
 static int depth_copied_this_frame(uint64_t serial) { for (int i = 0; i < 16; i++) if (g_cpd[i].serial == serial && g_cpd[i].frame == g_scan_frame) return 1; return 0; }
 static void clear_ds(const p_clear_ds *c) {
     if (S->render_skip) return;
+    FH(0xD5); g_fh_clears++;
     if (!P.valid) pass_targets();
     if (!P.dv) return;
     { static int keep = -1; if (keep < 0) { const char *e = getenv("NXRT_VK_KEEP_COPIED_DEPTH"); keep = e && *e == '1'; }
@@ -538,10 +548,10 @@ static void clear_ds(const p_clear_ds *c) {
 static inline uint64_t tex_slot_h(int st, unsigned reg) {   // nvn_mtl.m tex_slot_h: combined slots past 31 share their c2 word with an image slot
     return reg >= 32 && reg - 32 < DMSH_C2_IMG_SLOTS && S->img[st][reg - 32] ? S->img[st][reg - 32] : reg < NTEX ? S->tex[st][reg] : 0;
 }
-static VkSampler samp_get(int sid) {
+static VkSampler samp_get(int sid, const vkt_image *im) {   // im: the image it is bound with (N1: no depth comparison on a colour image), NULL where unknown
     samp_par p;
     if (sid <= 0 || !vkt_samp_copy(sid, &p)) return R0.samp;
-    VkSampler s = vkt_sampler(&p);
+    VkSampler s = vkt_sampler_for(&p, im);
     return s ? s : R0.samp;
 }
 static int nvn_target_of(VkImageViewType vt, int ms) {
@@ -646,7 +656,7 @@ static VkImageView tex_view(int tid, const vks_bind *b, VkImageLayout *layout, v
         RED_ONCE(31, "a 3D texture read as another type, or the reverse (texture ID %d, ser%llu %ux%ux%u view type %d; shader %s binding %u declares view type %d): it reads 0", tid,
                  (unsigned long long)im->serial, im->w, im->h, im->depth, (int)have, g_cur_sh ? g_cur_sh->key : "?", b->binding, (int)b->vtype);
         return VK_NULL_HANDLE; }
-    if (b->depth && !(im->aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) {
+    if (vkt_cmp_needs_twin(b->depth, im->aspect)) {
         VkImageView dv = dcmp_view(im, b->vtype);
         if (dv) { *layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL; return dv; }
     }
@@ -688,6 +698,18 @@ static VkBufferView tbuf_view(int tid, int ct) {   // a buffer texture: a texel 
 static int c0_ssbo_base(int st) { return st == 0 ? DMSH_C0_SSBO_VS : st == 1 ? DMSH_C0_SSBO_PS : st == 2 ? DMSH_C0_SSBO_GS : st == 5 ? DMSH_C0_SSBO_CS : -1; }
 static uint32_t g_draw_binst, g_dispatch_dim[3];
 static void put_range(uint8_t *d, unsigned off, uint64_t a, uint64_t n) { if (off + 12 <= DMSH_DRV_SIZE) { uint32_t s = (uint32_t)n; memcpy(d + off, &a, 8); memcpy(d + off + 8, &s, 4); } }
+// nvnCommandBufferPushComputeConstants (P3b, release-reports/22): NXRT_VK_PUSH_CC=0 ignores the pushes (the roots stay zero, as with the old stub)
+static int pushcc_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("NXRT_VK_PUSH_CC"); on = !(e && *e == '0'); } return on; }
+// The pushed words into the dispatch's c0, in the roots' room; logged once per shader (what the replay placed, or that nothing was pushed before it)
+static void pushcc_fill(uint8_t *d, const vks_shader *sh) {
+    uint32_t room = sh->s2_ubo_base - 0x10; if (!pushcc_on() || !room) return;
+    uint32_t put = S->cpc_n ? vkc0_push_to_bank(d, DMSH_DRV_SIZE, sh->s2_roots, sh->s2_has_roots, room, &S->cpc) : 0;
+    static const vks_shader *seen[128]; static int ns;
+    for (int i = 0; i < ns; i++) if (seen[i] == sh) return;
+    if (ns < 128) seen[ns++] = sh;
+    VKLOG("push-cc: compute shader %s has %u root bytes (%s tables %d,%d,%d,%d,..): %s", sh->key, room, sh->s2_has_roots ? "words per" : "no counts in the cache,", sh->s2_roots[0], sh->s2_roots[1], sh->s2_roots[2], sh->s2_roots[3],
+          put ? "pushed constants placed in c0" : "nothing pushed before this dispatch: the roots read zeros (NXRT_VK_PUSH_CC=0 ignores pushes)");
+}
 // A driver segment as the shader reads it (dmsh_abi.h): c0 the buffer tables and per-draw words, c2 the handle tables
 static void drv_fill(uint8_t *d, const vks_shader *sh, int st, int bank) {
     memset(d, 0, DMSH_DRV_SIZE);
@@ -699,8 +721,8 @@ static void drv_fill(uint8_t *d, const vks_shader *sh, int st, int bank) {
             // (the SSBO words 12..26 at 0x744a757f00, the NaN the deferred light volumes multiplied by 0 into the HDR target, and the NaN the CPU reads from 0x744fdfe00c)
             { static int on = -1; if (on < 0) { const char *e = getenv("NXRT_VK_S2_C0_DISPATCH"); on = !(e && *e == '0'); }   // NXRT_VK_S2_C0_DISPATCH=0: the zero header of before (to compare)
               uint32_t g[4] = {0, g_dispatch_dim[0], g_dispatch_dim[1], g_dispatch_dim[2]}; if (on) memcpy(d, g, 16); }
-            for (int r = 0; r < 16 && 0x10u + 16u * r + 16 <= sh->s2_ssbo_base; r++) put_range(d, 0x10 + 16 * r, S->ubo[5][r].addr, S->ubo[5][r].size);
-            for (int r = 0; r < 16 && sh->s2_ssbo_base + 16u * r + 16 <= sh->s2_tex_base; r++) put_range(d, sh->s2_ssbo_base + 16 * r, S->ssbo[5][r].addr, S->ssbo[5][r].size);
+            { vkc0_parts cp = {sh->s2_ubo_base - 0x10, sh->s2_ubo_base, sh->s2_ssbo_base, sh->s2_tex_base}; vkc0_pack_bufs(d, DMSH_DRV_SIZE, &cp, S->ubo[5], S->ssbo[5]); }   // vk_c0.h: the roots' room (the words nvnCommandBufferPushComputeConstants writes) is before the uniform table
+            pushcc_fill(d, sh);
             for (uint32_t r = 0; r < sh->s2_ntex && sh->s2_tex_base + 8 * r + 4 <= DMSH_DRV_SIZE; r++) { uint32_t h = (uint32_t)S->tex[5][r]; memcpy(d + sh->s2_tex_base + 8 * r, &h, 4); }
             for (uint32_t r = 0; r < 8 && sh->s2_tex_base + 8 * (sh->s2_ntex + r) + 4 <= DMSH_DRV_SIZE; r++) { uint32_t h = (uint32_t)S->img[5][r]; memcpy(d + sh->s2_tex_base + 8 * (sh->s2_ntex + r), &h, 4); }
             return;
@@ -834,7 +856,7 @@ static VkDescriptorSet write_set(const vks_shader *sh, int st, int *swrites) {
                                                   : b->samp_kind == VKB_SAMP_ID ? b->samp_reg : (int)((h >> 20) & 0xfff);
                 vkt_image *im;
                 o->imageView = tex_view(tid, b, &o->imageLayout, &im);
-                o->sampler = samp_get(sid);
+                o->sampler = samp_get(sid, im);
                 if (!o->imageView) o->imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             }
             x->pImageInfo = o; break; }
@@ -950,7 +972,7 @@ static void bl_want_build(void) {
     for (uint32_t i = limit ? limit : 1; i < n; i++) {   // the index * 32 form of the handle (handle_id's VKH_OFFSET): slot j * 32 holds slot j
         if (i % 32 == 0 && i / 32 < limit && i / 32 > 0 && BL.wv[i / 32] != BL.dummy) { BL.wv[i] = BL.wv[i / 32]; BL.wl[i] = BL.wl[i / 32]; if (i > BL.w_hi) BL.w_hi = i; }
     }
-    for (uint32_t i = 0; i < BL.nsamp; i++) BL.ws[i] = samp_get(BL.w_sbase + (int)i);
+    for (uint32_t i = 0; i < BL.nsamp; i++) BL.ws[i] = samp_get(BL.w_sbase + (int)i, NULL);
     BL.rebuilds++;
     static int nl; if (nl++ < 8 || !(nl & 255)) VKLOG("bindless pools: wanted state rebuilt (#%llu) for texture ids %d.. / sampler ids %d..: %u depth, %u small colour (depth-compare stand-ins) of %u slots, %.2f ms",
                                                       (unsigned long long)BL.rebuilds, BL.w_tbase, BL.w_sbase, ndepth, nsmall, limit, (double)(now_ns() - t0) / 1e6);
@@ -1300,7 +1322,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
             else if (di->count > 0) vkCmdDrawIndexed(cb, (uint32_t)di->count, inst, 0, di->base_vertex, (uint32_t)di->base_instance);
         }
     }
-    g_st.draws++;
+    g_st.draws++; FH(0xDA);
     (void)swrites;
     if (g_pd) {   // NXRT_VK_WATCH: after each draw that binds the watched storage buffer, what the mirror holds there (changes only; the draw's fragment shader names who read it)
         static uint64_t wa; static uint32_t wn; static int wi; if (!wi) { wi = 1; const char *e = getenv("NXRT_VK_WATCH"); if (e) { char *end; wa = strtoull(e, &end, 16); wn = *end == ',' ? (uint32_t)strtoul(end + 1, NULL, 0) : 192; if (wn > 1024) wn = 1024; } }
@@ -1402,15 +1424,45 @@ static const vks_shader *movie_yuv_cs(void) {
     if (!s) VKRED("movie stand-in: its compute shader could not be made (%s): movies stay black", why ? why : "?");
     return s;
 }
-static uint64_t g_movie_dst;   // the serial of the movie target the NV12 stand-in last wrote: later chain dispatches that write it are skipped (see dispatch_run)
-static int movie_yuv_match(uint32_t *tw, uint32_t *th, uint64_t *dser) {
+static uint64_t g_movie_dst;   // the serial of the movie target the NV12 stand-in last wrote
+static movie_chain g_movie_chain;
+static char g_movie_chain_keys[512]; static int g_movie_chain_logged;
+static int ndsr_reg(uint64_t h, vkt_reg *r);
+static int movie_chain_skip_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("NXRT_MOVIE_CHAIN_SKIP"); on = !(e && *e && !atoi(e)); } return on; }
+static int movie_chain_key_seen(const char *key) {
+    size_t n = strlen(key); const char *p = g_movie_chain_keys;
+    while (*p) { while (*p == ',') p++; const char *e = strchr(p, ','); size_t m = e ? (size_t)(e - p) : strlen(p); if (m == n && !memcmp(p, key, n)) return 1; if (!e) break; p = e + 1; }
+    return 0;
+}
+static int movie_yuv_match(uint32_t *tw, uint32_t *th, uint64_t *dser, uint64_t *yser, uint64_t *uvser) {
     static int on = -1; if (on < 0) { const char *e = getenv("NXRT_MOVIE_STANDIN"); on = !(e && *e && !atoi(e)); }
     if (!on) return 0;
     vkt_reg y, uv, dst;
     if (!vkt_reg_copy((int)(tex_slot_h(5, 1) & 0xfffff), &y) || !vkt_reg_copy((int)(tex_slot_h(5, 2) & 0xfffff), &uv) || !vkt_reg_copy((int)(S->img[5][1] & 0xfffff), &dst)) return 0;
     if (y.t.d.format != 0x01 || uv.t.d.format != 0x0d || dst.t.d.width < 64 || y.t.d.width < 64) return 0;
     if (uv.t.d.width != (y.t.d.width + 1) / 2 || uv.t.d.height != (y.t.d.height + 1) / 2 || y.t.d.target == NVN_TEXTURE_TARGET_BUFFER) return 0;
-    *tw = dst.t.d.width; *th = dst.t.d.height; *dser = dst.t.serial;
+    *tw = dst.t.d.width; *th = dst.t.d.height; *dser = dst.t.serial; *yser = y.t.serial; *uvser = uv.t.serial;
+    return 1;
+}
+static int movie_chain_dispatch_skip(const vks_shader *cs) {
+    if (!movie_chain_skip_on() || !g_movie_chain.active) { if (!movie_chain_skip_on()) movie_chain_reset(&g_movie_chain); return 0; }
+    static keylist keys;
+    int listed = key_listed(&keys, "NXRT_MOVIE_CHAIN", "31078bf4602f41d4,dd55b38005a1f81a,8329f4e8a334f590,4d4715ba11a53e3e,0615da0fddc1430d,80b0627d616649a9,8e3573c39cace499,7a29e1f859b9901e,8f8bb88f2585bf2f,85a5cf57b4437b5f", cs->key);
+    movie_chain_binding b[64]; unsigned n = 0;
+    for (int i = 0; i < cs->nb && n < sizeof b / sizeof *b; i++) {
+        const vks_bind *x = &cs->b[i]; uint64_t h = 0;
+        if (x->reg < 0 || x->reg >= 32) continue;
+        if (x->kind == VKB_TEX) h = tex_slot_h(5, (unsigned)x->reg);
+        else if (x->kind == VKB_IMG) h = S->img[5][x->reg];
+        else continue;
+        vkt_reg r; if (!ndsr_reg(h, &r)) continue;
+        b[n++] = (movie_chain_binding){r.t.serial, 1, x->kind == VKB_IMG};
+    }
+    if (!movie_chain_skip(&g_movie_chain, 1, listed, b, n)) return 0;
+    if (!movie_chain_key_seen(cs->key)) {
+        size_t used = strlen(g_movie_chain_keys), need = strlen(cs->key) + (used ? 1 : 0);
+        if (used + need < sizeof g_movie_chain_keys) { if (used) g_movie_chain_keys[used++] = ','; strcpy(g_movie_chain_keys + used, cs->key); }
+    }
     return 1;
 }
 // NXRT_SKIP_COMPUTE=<key>,<key>... (hex shader keys, separated by commas, spaces or colons; "all" or "*" skips every compute dispatch): the listed compute shaders are never
@@ -1447,7 +1499,6 @@ static const vks_shader *ndsr_blit_cs(void) {
     if (!s) VKRED("NDSR final stand-in: its compute shader could not be made (%s)", why ? why : "?");
     return s;
 }
-typedef struct { char *list; int init; } keylist;
 static int key_listed(keylist *kl, const char *env, const char *def, const char *key) {
     if (!kl->init) {
         kl->init = 1; const char *e = getenv(env); if (!e || !*e) e = def;
@@ -1546,16 +1597,19 @@ static void dispatch(const p_dispatch *dp) {
 }
 static void dispatch_run(const p_dispatch *dp, const vks_shader *force_cs) {
     const vks_shader *cs = force_cs ? force_cs : S->cprog ? prog_stage(S->cprog, VKS_CS) : NULL;
-    p_dispatch md;
+    p_dispatch md; int movie_standin_ran = 0;
     // the movie chain's first program (fdbba6b7fcecc235, NXRT_MOVIE_YUV) is in the shader cache since the 0x14 control-block dumps are translated: it still gets the NV12 stand-in
     // (the translated one fills an intermediate the stand-in does not use), and the later dispatches that translate now and store to the movie target are skipped, as they were
     // when they had no shader: they would overwrite the stand-in's picture with the output of a chain that never got its input
     static keylist myuv;
-    if (!force_cs && S->cprog && (!cs || key_listed(&myuv, "NXRT_MOVIE_YUV", "fdbba6b7fcecc235", cs->key))) { uint32_t w, h; uint64_t ser;
-        if (movie_yuv_match(&w, &h, &ser) && (cs = movie_yuv_cs())) {
+    int movie_probe = !force_cs && S->cprog && (!cs || key_listed(&myuv, "NXRT_MOVIE_YUV", "fdbba6b7fcecc235", cs->key));
+    if (movie_probe) { uint32_t w, h; uint64_t ser, yser, uvser;
+        if (movie_yuv_match(&w, &h, &ser, &yser, &uvser) && (cs = movie_yuv_cs())) {
             md = *dp; md.x = (w + 7) / 8; md.y = (h + 7) / 8; md.z = 1; md.ind = 0; dp = &md; g_movie_dst = ser;
+            uint64_t seed[] = {yser, uvser, ser}; movie_chain_begin(&g_movie_chain, seed, 3); movie_standin_ran = 1;
             static int nlog; if (nlog++ < 3) VKLOG("movie stand-in: NV12 -> RGB into the %ux%u target in place of the game's YUV pass (BT.709 limited, bilinear)", w, h); } }
-    else if (!force_cs && cs && g_movie_dst) {
+    if (!movie_standin_ran && !force_cs && cs && movie_chain_dispatch_skip(cs)) { g_st.skip_env++; return; }
+    if (!movie_standin_ran && !movie_probe && !force_cs && cs && g_movie_dst) {
         for (int i = 0; i < cs->nb; i++) { vkt_reg r; if (cs->b[i].kind != VKB_IMG || cs->b[i].reg < 0 || cs->b[i].reg >= 32) continue;
             if (ndsr_reg(S->img[5][cs->b[i].reg], &r) && r.t.serial == g_movie_dst) { g_st.skip_env++; static int n; if (n++ < 4) VKLOG("movie stand-in: compute shader %s skipped: it stores to the movie target the stand-in wrote", cs->key); return; } } }
     if (!cs) {
@@ -1628,7 +1682,7 @@ static void dispatch_run(const p_dispatch *dp, const vks_shader *force_cs) {
     vk_checkpoint(cb, 'c', cs->key, g_dispatch_dim[0], g_dispatch_dim[1], g_dispatch_dim[2], dp->ind != 0);
     if (dp->ind) { vkCmdDispatchIndirect(cb, ind_buf, ind_off); }
     else if (vkm_ind_direct(cs->key, dp->x, dp->y, dp->z), dp->x > 0 && dp->y > 0 && dp->z > 0) { vkCmdDispatch(cb, (uint32_t)dp->x, (uint32_t)dp->y, (uint32_t)dp->z); }
-    g_st.dispatches++;
+    g_st.dispatches++; { const char *k = cs->key; FH(0xC5); for (; *k; k++) FH(*k); }
     if (vkm_ind_is_wanted(cs->key) && g_gm_np) { barrier_all(cb); for (int i = 0; i < g_gm_np; i++) vkm_snap(cb, cs->key, "post", g_gm_ptr[i]); }
     if (g_nbnc) {   // written bounced storage buffers back into their pools, before the write-back to guest memory below reads them
         barrier_all(cb);
@@ -1901,13 +1955,46 @@ static void clear_tex(const p_clear_tex *c) {
 // (OP_RENDER_COND) reads those records while the next submission is replayed, which can happen before the previous one has completed: it then read the
 // previous "visible" value (Eglantine beaf6932: the OoT predicate macro read a stale record, fog was drawn over Link and parts flickered). The replay notes
 // where each recorded report will land and the timeline value that lands it; render_cond waits for that value before it reads
-enum { NREP = 64 };
+// The table of pending reports: a hash by 16-byte granule of the report address, one entry per address (a newer report at the same address replaces the older one: the newest value is the one that matters).
+// An entry is live while its timeline value is above tl_done and is reused afterwards, so the table never drops an in-flight report unless 32 probes in a row are all live (counted, logged [RED]). The first
+// version was a ring of 64 entries (NXRT_VK_REP_LEGACY=1 keeps it, for A/B): OoT notes ~1300 samples-passed reports a frame, so most entries were overwritten while their submission was still in flight
+enum { NREP = 64, REPT = 1 << 16, REPT_PROBES = 32 };
 static struct { uint64_t addr, value; } g_rep[NREP]; static unsigned g_rep_n;
-static void rep_note(uint64_t addr) { uint64_t v = vks_recording_value(); if (!v) return; g_rep[g_rep_n].addr = addr; g_rep[g_rep_n].value = v; g_rep_n = (g_rep_n + 1) % NREP; }
+static struct { uint64_t addr, value; } *g_rept;
+static uint64_t g_rep_notes, g_rep_lost, g_rep_conds, g_rep_cond_stale, g_rep_hw, g_rep_ovf;   // diagnostics: reports noted, entries lost while their submission was still in flight, conditional renders, ones that read a record not yet landed, high-water of live entries, overflows of the table
+static int rep_legacy(void) { static int m = -1; if (m < 0) { const char *e = getenv("NXRT_VK_REP_LEGACY"); m = e && atoi(e); } return m; }
+static void rep_note(uint64_t addr) {
+    uint64_t v = vks_recording_value(); if (!v) return; g_rep_notes++;
+    if (rep_legacy()) { if (g_rep[g_rep_n].value > atomic_load(&g_vk.tl_done)) g_rep_lost++; g_rep[g_rep_n].addr = addr; g_rep[g_rep_n].value = v; g_rep_n = (g_rep_n + 1) % NREP; return; }
+    if (!g_rept) { g_rept = calloc(REPT, sizeof *g_rept); if (!g_rept) return; }
+    uint64_t done = atomic_load(&g_vk.tl_done), g = (addr >> 4) * 0x9E3779B97F4A7C15ull >> 48;
+    unsigned free_at = ~0u;
+    for (unsigned k = 0; k < REPT_PROBES; k++) {
+        unsigned i = (unsigned)(g + k) & (REPT - 1);
+        if (g_rept[i].addr == addr && g_rept[i].value) { g_rept[i].value = v; return; }
+        if (free_at == ~0u && (!g_rept[i].value || g_rept[i].value <= done)) free_at = i;
+    }
+    if (free_at == ~0u) { g_rep_ovf++; g_rep_lost++; if (g_rep_ovf == 1) VKRED("the pending-report table is full (%d probes all in flight): a report is not tracked", REPT_PROBES); return; }
+    g_rept[free_at].addr = addr; g_rept[free_at].value = v;
+}
+// Live entries now (value above tl_done), and the high-water mark of that; called once a frame
+static void rep_frame(void) {
+    if (!g_rept || rep_legacy()) return;
+    uint64_t done = atomic_load(&g_vk.tl_done), n = 0; for (unsigned i = 0; i < REPT; i++) n += g_rept[i].value > done;
+    if (n > g_rep_hw) g_rep_hw = n;
+}
 // The newest recorded report whose 16 bytes overlap [addr, addr + 16): the value its write lands with (0 = none)
 static uint64_t rep_pending(uint64_t addr) {
     uint64_t best = 0;
-    for (unsigned i = 0; i < NREP; i++) if (g_rep[i].value && g_rep[i].addr + 16 > addr && addr + 16 > g_rep[i].addr && g_rep[i].value > best) best = g_rep[i].value;
+    if (rep_legacy()) { for (unsigned i = 0; i < NREP; i++) if (g_rep[i].value && g_rep[i].addr + 16 > addr && addr + 16 > g_rep[i].addr && g_rep[i].value > best) best = g_rep[i].value; return best; }
+    if (!g_rept) return 0;
+    for (uint64_t a = (addr & ~15ull) - 16; a <= (addr & ~15ull) + 16; a += 16) {   // an entry is stored at its own address: the granules around addr
+        uint64_t g = (a >> 4) * 0x9E3779B97F4A7C15ull >> 48;
+        for (unsigned k = 0; k < REPT_PROBES; k++) {
+            unsigned i = (unsigned)(g + k) & (REPT - 1);
+            if (g_rept[i].value && g_rept[i].addr + 16 > addr && addr + 16 > g_rept[i].addr && g_rept[i].value > best) best = g_rept[i].value;
+        }
+    }
     return best;
 }
 // Makes the reports recorded at addr and addr + 16 visible in guest memory: flushes the queue and waits for the submissions that hold them. A report of the
@@ -2000,11 +2087,28 @@ static void set_rt(const p_set_rt *r) {
 }
 static void render_cond(const p_render_cond *rc) {   // nvn_mtl.m OP_RENDER_COND: the counters as guest memory holds them at replay
     if (rc->mode >= 2) { S->render_skip = rc->mode == 3; return; }
+    g_rep_conds++; g_fh_cond++;
+    { uint64_t need = rep_pending(rc->addr), n2 = rep_pending(rc->addr + 16); if (n2 > need) need = n2; if (need > atomic_load(&g_vk.tl_done)) g_rep_cond_stale++; }
     rep_make_visible(rc->addr);
     uint64_t x = 0, y = 0; uint32_t lo = 0, hi = 0; int known = 1;
     known &= read_u32(rc->addr, &lo) && read_u32(rc->addr + 4, &hi); x = (uint64_t)hi << 32 | lo;
     known &= read_u32(rc->addr + 16, &lo) && read_u32(rc->addr + 20, &hi); y = (uint64_t)hi << 32 | lo;
     S->render_skip = known && (rc->mode ? x == y : x != y);
+}
+
+// A push of constants into a compute root table, applied in the order of the list (dispatches after it see it; vk_c0.h). Logged once per distinct (table, offset, bytes)
+static void push_const(const p_push_const *r, uint32_t size) {
+    if (!pushcc_on()) return;
+    unsigned n = vkc0_push_apply(&S->cpc, r, size);
+    if (!n) { RED_ONCE(140, "a malformed constants push (compute %d, table %d, offset %d, bytes %d, record %u bytes): ignored", r->compute, r->table, r->offset, r->bytes, size); return; }
+    S->cpc_n++;
+    static struct { int t, o, n; } seen[64]; static int ns;
+    for (int i = 0; i < ns; i++) if (seen[i].t == r->table && seen[i].o == r->offset && seen[i].n == r->bytes) return;
+    if (ns >= 64) return;
+    seen[ns].t = r->table; seen[ns].o = r->offset; seen[ns++].n = r->bytes;
+    const uint32_t *w = &S->cpc.w[r->table][r->offset / 4]; float f0; memcpy(&f0, w, 4);
+    VKLOG("push-cc: PushComputeConstants table %d offset %#x bytes %#x%s, first words %08x %08x %08x %08x (%g ...); applied in order to the dispatches that follow (NXRT_VK_PUSH_CC=0 turns this off)", r->table, r->offset, r->bytes,
+          r->src ? " (deferred)" : "", w[0], n > 1 ? w[1] : 0, n > 2 ? w[2] : 0, n > 3 ? w[3] : 0, f0);
 }
 
 // ---------- The record walk (nvn_mtl.m mtl_exec; the framing checks of track B's walk) ----------
@@ -2046,6 +2150,7 @@ static int walk(const uint8_t *p, int depth, uint64_t *budget) {
         case OP_CLEAR_TEX: clear_tex((const p_clear_tex *)a); break;
         case OP_DRAW_TEX: RED_ONCE(120, "DrawTexture is not replayed yet"); break;
         case OP_RENDER_COND: render_cond((const p_render_cond *)a); break;
+        case OP_PUSH_CONST: push_const((const p_push_const *)a, h.size); break;
         case OP_TF_BIND: break;
         default: state_op(h.op, a); break;
         }
@@ -2173,8 +2278,15 @@ static void memsearch(uint64_t frame) {
 #endif
 }
 void vkr_frame(uint64_t frame) {
+    if (!g_movie_chain_logged && g_movie_chain_keys[0]) { VKLOG("movie stand-in: skipped compute chain keys: %s", g_movie_chain_keys); g_movie_chain_logged = 1; }
+    movie_chain_reset(&g_movie_chain);
+    {   // NXRT_VK_INFLIGHT=<k> (experiment): a present waits until the GPU has finished everything submitted up to the present k frames before (0 = no limit)
+        static int k = -1; static uint64_t ring[16]; if (k < 0) { const char *e = getenv("NXRT_VK_INFLIGHT"); k = e ? atoi(e) : 0; if (k > 15) k = 15; }
+        if (k < 0) { uint64_t v = atomic_load(&g_vk.tl_assigned); if (v) vks_wait(v, UINT64_MAX); }   // -1: the present waits for everything submitted so far
+        if (k > 0) { uint64_t old = ring[(frame + 16 - (uint64_t)k) % 16]; if (old) vks_wait(old, UINT64_MAX); ring[frame % 16] = atomic_load(&g_vk.tl_assigned); }
+    }
     ab_poll(frame); g_scan_frame = frame; guest_poke(); memsearch(frame);
-    gwatch_frame(frame); copylog_report(frame);
+    gwatch_frame(frame); copylog_report(frame); rep_frame();
     static vkr_stats_t prev; static uint64_t pf;
     long pr = atomic_exchange(&g_pd_req, 0); if (pr > 0) { g_pd_frame = frame; g_pd_last = frame + (uint64_t)pr - 1; }   // DM_CTL passdump / texdump: from this frame on
     if (atomic_exchange(&g_td_req, 0)) g_td_frame = frame;
@@ -2203,6 +2315,11 @@ void vkr_frame(uint64_t frame) {
     }
     g_td_on = g_td_frame && frame == g_td_frame;
     if (g_pd) PD("---- the frame after present %llu ----", (unsigned long long)frame);
+    { static int on = -1; if (on < 0) { const char *e = getenv("NXRT_VK_FRAMESTATS"); on = e && atoi(e); }
+      if (on) { static vkr_stats_t ps; vkr_stats_t c = g_st;
+          VKLOG("fs: frame %llu hash %016llx draws %llu passes %llu clears %llu disp %llu cond %llu copies %llu upd %llu skip %llu wb %llu", (unsigned long long)frame, (unsigned long long)g_fh, (unsigned long long)(c.draws - ps.draws), (unsigned long long)(c.passes - ps.passes),
+                (unsigned long long)(c.clears - ps.clears), (unsigned long long)(c.dispatches - ps.dispatches), (unsigned long long)g_fh_cond, (unsigned long long)(c.copies + c.tex_copies - ps.copies - ps.tex_copies), (unsigned long long)(c.updates - ps.updates), (unsigned long long)(c.draws_skipped - ps.draws_skipped), (unsigned long long)(c.writebacks - ps.writebacks));
+          ps = c; g_fh = 1469598103934665603ull; g_fh_cond = 0; } }
 
     if (frame % 300 || frame == pf) return;
     static uint64_t pgn, pgs; uint64_t gn = atomic_load(&g_gpu_ns), gs = atomic_load(&g_gpu_subs);
@@ -2221,6 +2338,7 @@ void vkr_frame(uint64_t frame) {
           (double)(s.pool_draws - prev.pool_draws) / df, (unsigned long long)s.pool_draws, (unsigned long long)(s.skip_bigarray - prev.skip_bigarray), (unsigned long long)s.skip_bigarray, (unsigned long long)BL.writes);
     if (s.rep_waits != prev.rep_waits || s.handles_bad != prev.handles_bad) VKLOG("up to frame %llu: %llu conditional renders waited for counter reports (%llu in all), %llu texture handles outside the pool (%llu in all)", (unsigned long long)frame,
           (unsigned long long)(s.rep_waits - prev.rep_waits), (unsigned long long)s.rep_waits, (unsigned long long)(s.handles_bad - prev.handles_bad), (unsigned long long)s.handles_bad);
+    if (g_rep_notes) VKLOG("counter reports up to frame %llu: %llu noted (%llu not tracked: the entry was overwritten, or the table was full, while its submission was still in flight; %llu table overflows), high-water %llu live entries (%s), %llu conditional renders, %llu of them read a record that had not landed yet", (unsigned long long)frame, (unsigned long long)g_rep_notes, (unsigned long long)g_rep_lost, (unsigned long long)g_rep_ovf, (unsigned long long)g_rep_hw, rep_legacy() ? "legacy ring of 64" : "table", (unsigned long long)g_rep_conds, (unsigned long long)g_rep_cond_stale);
     if (ps.prewarmed) VKLOG("pipelines made ahead by the prewarm up to frame %llu: %llu (%.1f ms on its threads)", (unsigned long long)frame, (unsigned long long)ps.prewarmed, ps.prewarm_ns / 1e6);
     prev = s; pf = frame;
 }

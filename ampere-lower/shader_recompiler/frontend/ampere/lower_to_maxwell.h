@@ -66,6 +66,20 @@ struct LoweredProgram {
     explicit operator bool() const { return error.empty(); }
 };
 
+// The third source field is not a GPR on most encodings. ISBEWR is an
+// exception: bits 32-39 select its data register and high values must be
+// copied out of the emulated uniform-register mirror before lowering.
+inline bool NeedsRegisterShadow(const Instruction& instruction, u32 reserved_register) {
+    const u32 opcode = instruction.Bits(0, 12);
+    for (u32 bit : {16U, 24U, 32U, 64U}) {
+        if (bit == 32 && instruction.Bits(9, 3) != 1 && opcode != 0xb60 && opcode != 0xb66 &&
+            opcode != 0x986 && opcode != 0x927 && opcode != 0x593) continue;
+        const u32 reg = instruction.Bits(bit, 8);
+        if (reg >= reserved_register && reg < 255) return true;
+    }
+    return false;
+}
+
 // Lower only operations whose semantics are representable by the existing
 // Maxwell frontend. These are new instructions, not reinterpretations of the
 // native bytes. Scheduling/control words are added by the environment adapter.
@@ -396,12 +410,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
         // Scratch values and emulated uniform state occupy reserved high GPRs.
         // Reject native accesses that could alias that state.
         RegisterPressure pressure{insn};
-        bool requires_shadow = false;
-        for (u32 bit : {16U, 24U, 32U, 64U}) {
-            if (bit == 32 && insn.Bits(9, 3) != 1 && opcode != 0xb60 && opcode != 0xb66 && opcode != 0x986 && opcode != 0x927) continue;
-            const u32 reg = insn.Bits(bit, 8);
-            if (reg >= reserved_register && reg < 255) requires_shadow = true;
-        }
+        const bool requires_shadow = NeedsRegisterShadow(insn, reserved_register);
         if (requires_shadow) {
             if (!allow_register_spills) return fail(index, "native program uses lowering scratch registers");
             pressure = PrepareRegisterPressure(insn, reserved_register);
@@ -2188,6 +2197,25 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
                  (u64{insn.Bits(90, 1)} << 49));
             break;
         }
+        case 0x593: { // SUATOM.P, typed surface atomic; result is the previous value.
+            const u32 binding = insn.Bits(54, 5), offset = insn.Bits(40, 14);
+            const u32 data = insn.Bits(32, 8), coordinate = insn.Bits(24, 8);
+            const u32 dimension = insn.Bits(61, 3), operation = insn.Bits(87, 4);
+            const u32 coordinates = dimension >= 4 ? 3U : dimension == 3 ? 2U : 1U;
+            if ((insn.words[2] & ~0x07800000U) != 0x001ee000 || operation > 8 ||
+                dimension == 2 || dimension > 5 || binding >= 18 || offset > 0x1fff ||
+                insn.Bits(59, 2) || coordinate + coordinates > reserved_register ||
+                (data != 255 && data >= reserved_register) || (dest != 255 && dest >= reserved_register) ||
+                (insn.words[3] & 0xc00001ffU))
+                return fail(index, "native formatted surface atomic mode");
+            if (result.required_texture_buffer != ~0U && result.required_texture_buffer != binding)
+                return fail(index, "native surface descriptor buffer conflict");
+            result.required_texture_buffer = binding;
+            // Maxwell SUATOM returns the old surface value in Rd; op and dimension share its SASS fields.
+            emit(base(0xea00000000000000ULL) | (u64{coordinate} << 8) | (u64{data} << 20) |
+                 (u64{operation} << 29) | (u64{dimension} << 33) | (u64{offset} << 36));
+            break;
+        }
         case 0x59f: { // SURED.D.{ADD,AND,OR,XOR}.STRONG.GPU.IGN U32, direct descriptor, buffer or 2D.
             const u32 binding = insn.Bits(54, 5), offset = insn.Bits(40, 14);
             const u32 data = insn.Bits(32, 8), coordinate = insn.Bits(24, 8);
@@ -2299,23 +2327,14 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
                     return fail(index, "native per-tap gather operands");
                 if (result.required_texture_buffer != ~0U && result.required_texture_buffer != binding)
                     return fail(index, "native texture descriptor buffer conflict");
-                std::array<u32, 2> packed_offsets{};
-                for (u32 i = 0; i < 2; ++i) {
-                    const auto value = constant_register(index, source_b + i);
-                    if (!value) return fail(index, "native per-tap gather nonconstant offsets");
-                    // Each byte is a signed 6-bit offset; the gather reads only the low six bits.
-                    for (u32 shift = 0; shift < 32; shift += 8) {
-                        const u32 byte = (*value >> shift) & 255;
-                        if (byte > 31 && byte < 224) return fail(index, "native per-tap gather offset range");
-                    }
-                    packed_offsets[i] = *value;
-                }
                 result.required_texture_buffer = binding;
-                mov_imm(248, packed_offsets[0]);
-                mov_imm(249, packed_offsets[1]);
                 const auto copy = [&](u32 target, u32 source) {
                     emit(0x5c98000000000000ULL | predicate | target | (u64{15} << 39) | (u64{source} << 20));
                 };
+                // Maxwell's gather reads the signed six-bit tap offsets from these two register
+                // operands. Keep them dynamic; only the low six bits of each byte are consumed.
+                copy(248, source_b);
+                copy(249, source_b + 1);
                 copy(250, source_a);
                 copy(251, source_a + 1);
                 emit(0xc800000000000000ULL | predicate | 250 | (u64{250} << 8) | (u64{248} << 20) |

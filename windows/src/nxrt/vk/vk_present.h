@@ -21,6 +21,7 @@ uint64_t vkp_enqueue(uint64_t serial, double period, uint64_t wait_value, const 
 void vkp_wait(uint64_t ticket);             // until that present has been handed to the GPU (or dropped)
 void vkp_flush(void);                       // until every enqueued present has
 uint64_t vkp_count(void);                   // presents handed to the GPU so far
+void vkp_order_stats(uint64_t *n, uint64_t *back, uint64_t *same_val, uint64_t *same_tex);   // presents drawn, whose timeline value went back / did not advance, that showed the same texture as the one before
 uint64_t vkp_dropped(void);                 // presents dropped (window minimized or occluded, swapchain unusable)
 double vkp_presented_time(uint64_t n);      // seconds since start at which present n (from 1) was handed to the GPU; 0 = not yet, -1 = dropped
 void vkp_set_stall(uint64_t ns);            // unit tests: an extra pause before each present

@@ -149,8 +149,15 @@ class BaselineTests(unittest.TestCase):
         self.assertEqual(abi.exports_summary(d['exports']['names'])['sha256'], d['exports']['sha256'])
         self.assertIn('provenance', d)
 
+    def test_committed_v016_baseline_is_well_formed_and_matches_its_source(self):
+        d = json.loads((REL / 'abi-baseline-v0.1.6.json').read_text())
+        self.assertEqual(1, d['abi_version'])
+        self.assertEqual(d['registry']['count'], len(d['registry']['entries']))
+        self.assertEqual(abi.registry_summary(d['registry']['entries'])['sha256'], d['registry']['sha256'])
+        self.assertEqual(abi.exports_summary(d['exports']['names'])['sha256'], d['exports']['sha256'])
+
     def test_current_source_registry_is_compatible_with_the_baseline(self):
-        d = json.loads((REL / 'abi-baseline-v0.1.3.json').read_text())
+        d = json.loads((REL / 'abi-baseline-v0.1.6.json').read_text())
         now = abi.build_descriptor(abi.parse_source(abi.read_source_files(ROOT)), d['exports']['names'], 'test')
         r = abi.compare(d, now)
         self.assertFalse(r['requires_rebuild'], r['reasons'])
